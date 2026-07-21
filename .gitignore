@@ -1,0 +1,51 @@
+# Runtime databases, WAL sidecars, and deterministic benchmark working clones.
+.data/
+.benchmark-workspace/
+benchmark-workspace/
+.experience-hub-benchmark-workspace
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+
+# Coverage and tool caches.
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.cache/
+__pycache__/
+*.py[cod]
+
+# Local provider configuration and secrets.
+.env
+.env.*
+!.env.example
+.secrets/
+.local/
+provider-secrets.*
+
+# Local process output and logs.
+.logs/
+logs/
+*.log
+
+# Build and virtual environments.
+build/
+dist/
+*.egg-info/
+.venv/
+venv/
+
+# Local editor metadata.
+.idea/
+
+# Deterministic benchmark source fixtures are committed assets, not clones.
+!benchmarks/
+!benchmarks/seed.json
+!benchmarks/cases.jsonl

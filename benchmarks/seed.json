@@ -1,0 +1,688 @@
+{
+  "schema_version": 1,
+  "clock": {
+    "started_at": "2026-02-01T00:00:00Z",
+    "cold_at": "2026-02-03T01:00:01Z"
+  },
+  "config": {
+    "retrieval_limit": 5,
+    "content_budget_bytes": 65536,
+    "expand_cold": true,
+    "generator": "deterministic",
+    "operators": [
+      "causal_gap",
+      "counterfactual",
+      "distant_analogy"
+    ],
+    "include_inbox": false,
+    "branches_per_operator": 3,
+    "output_tokens_per_operator": 1200,
+    "total_output_tokens": 3600,
+    "operator_timeout_seconds": 30,
+    "global_timeout_seconds": 90,
+    "lifecycle": {
+      "recency_half_life_hours": 168.0,
+      "frequency_half_life_hours": 336.0,
+      "warm_to_hot_threshold": 0.75,
+      "hot_to_warm_threshold": 0.62,
+      "warm_to_cold_threshold": 0.3,
+      "demotion_cycles": 2,
+      "archive_after_days": 90.0,
+      "archive_importance_threshold": 0.75,
+      "archive_confidence_threshold": 0.25,
+      "archive_strength_threshold": 0.1,
+      "minimum_cycle_interval_seconds": 900.0,
+      "worker_interval_seconds": 900.0,
+      "lease_duration_seconds": 300.0
+    }
+  },
+  "agents": [
+    {
+      "label": "benchmark_owner"
+    },
+    {
+      "label": "alice"
+    },
+    {
+      "label": "bob"
+    }
+  ],
+  "experiences": [
+    {
+      "label": "english_bounded_queue",
+      "owner_label": "benchmark_owner",
+      "kind": "procedural",
+      "body": "A bounded worker queue rejected excess arrivals before worker saturation and kept tail latency stable.",
+      "summary": "Bounded queue prevents worker overload",
+      "mechanism": "Backpressure limits arrivals when queue saturation rises.",
+      "tags": [
+        "coverage:english",
+        "coverage:operational_causality",
+        "retrieval:focused"
+      ],
+      "applicability": [
+        "worker concurrency is fixed"
+      ],
+      "evidence": [
+        {
+          "type": "benchmark_observation",
+          "id": "queue-load-001"
+        }
+      ],
+      "falsifiers": [
+        "Tail latency rises after admission is bounded."
+      ],
+      "importance": 0.65,
+      "confidence": 0.78,
+      "target_temperature": "warm"
+    },
+    {
+      "label": "chinese_cache_singleflight",
+      "owner_label": "benchmark_owner",
+      "kind": "procedural",
+      "body": "缓存租约到期时，单飞锁只允许一个请求重建数据，其余请求复用结果。",
+      "summary": "缓存租约防止并发重建雪崩",
+      "mechanism": "单飞锁把同一缓存键的并发重建合并为一个请求。",
+      "tags": [
+        "coverage:chinese",
+        "retrieval:focused"
+      ],
+      "applicability": [
+        "缓存键可以稳定归一化"
+      ],
+      "evidence": [
+        {
+          "type": "benchmark_observation",
+          "id": "cache-lock-001"
+        }
+      ],
+      "falsifiers": [
+        "相同缓存键仍然出现多个并发重建任务。"
+      ],
+      "importance": 0.66,
+      "confidence": 0.76,
+      "target_temperature": "warm"
+    },
+    {
+      "label": "mixed_lease_epoch",
+      "owner_label": "benchmark_owner",
+      "kind": "semantic",
+      "body": "Lease epoch 保护主节点切换：旧 leader 的写入会被新的 epoch fence 拒绝。",
+      "summary": "Lease epoch 保护 leader handoff",
+      "mechanism": "A monotonic epoch fence rejects stale primary writes during 主节点切换.",
+      "tags": [
+        "coverage:mixed",
+        "retrieval:focused"
+      ],
+      "applicability": [
+        "all writers carry the observed epoch"
+      ],
+      "evidence": [
+        {
+          "type": "benchmark_observation",
+          "id": "lease-epoch-001"
+        }
+      ],
+      "falsifiers": [
+        "A stale leader commits after a newer epoch is visible."
+      ],
+      "importance": 0.67,
+      "confidence": 0.79,
+      "target_temperature": "warm"
+    },
+    {
+      "label": "cold_retry_budget",
+      "owner_label": "benchmark_owner",
+      "kind": "procedural",
+      "body": "A retry budget stopped clients from amplifying a partial outage into a cascading retry storm.",
+      "summary": "Retry budget contains cascading retry storm",
+      "mechanism": "A shared retry token budget caps aggregate retry amplification.",
+      "tags": [
+        "coverage:cold_relevant",
+        "cold:focused"
+      ],
+      "applicability": [
+        "clients share one observable failure budget"
+      ],
+      "evidence": [
+        {
+          "type": "benchmark_observation",
+          "id": "retry-budget-001"
+        }
+      ],
+      "falsifiers": [
+        "Retry traffic exceeds the configured aggregate budget."
+      ],
+      "importance": 0.05,
+      "confidence": 0.05,
+      "target_temperature": "cold"
+    },
+    {
+      "label": "cold_schema_epoch",
+      "owner_label": "benchmark_owner",
+      "kind": "semantic",
+      "body": "A schema epoch attached to each mutation rejected stale writers after an online migration.",
+      "summary": "Schema epoch fences stale writers",
+      "mechanism": "Version fencing compares every write against the current schema epoch.",
+      "tags": [
+        "coverage:cold_relevant",
+        "cold:focused"
+      ],
+      "applicability": [
+        "all mutations declare a schema epoch"
+      ],
+      "evidence": [
+        {
+          "type": "benchmark_observation",
+          "id": "schema-epoch-001"
+        }
+      ],
+      "falsifiers": [
+        "A write with an older schema epoch is accepted."
+      ],
+      "importance": 0.05,
+      "confidence": 0.05,
+      "target_temperature": "cold"
+    },
+    {
+      "label": "cold_pressure_feedback",
+      "owner_label": "benchmark_owner",
+      "kind": "semantic",
+      "body": "A relief loop stabilized a steam vessel by releasing pressure in proportion to measured oscillation.",
+      "summary": "Pressure relief damps vessel oscillation",
+      "mechanism": "Negative feedback pressure relief stabilizes oscillation.",
+      "tags": [
+        "coverage:cold_relevant",
+        "coverage:distant_mechanism_analogy",
+        "cold:associative"
+      ],
+      "applicability": [
+        "pressure sensing latency stays below one control period"
+      ],
+      "evidence": [
+        {
+          "type": "benchmark_observation",
+          "id": "pressure-feedback-001"
+        }
+      ],
+      "falsifiers": [
+        "Oscillation grows after proportional pressure relief."
+      ],
+      "importance": 0.05,
+      "confidence": 0.05,
+      "target_temperature": "cold"
+    },
+    {
+      "label": "cold_mycelium_reroute",
+      "owner_label": "benchmark_owner",
+      "kind": "semantic",
+      "body": "A damaged fungal network shifted nutrient transport toward surviving neighboring paths without a central planner.",
+      "summary": "Mycelium reroutes around damaged paths",
+      "mechanism": "Distributed rerouting follows surviving local paths.",
+      "tags": [
+        "coverage:cold_relevant",
+        "coverage:distant_mechanism_analogy",
+        "cold:associative"
+      ],
+      "applicability": [
+        "neighboring paths expose local capacity signals"
+      ],
+      "evidence": [
+        {
+          "type": "benchmark_observation",
+          "id": "mycelium-route-001"
+        }
+      ],
+      "falsifiers": [
+        "Transport continues through a severed path despite available neighbors."
+      ],
+      "importance": 0.05,
+      "confidence": 0.05,
+      "target_temperature": "cold"
+    },
+    {
+      "label": "cold_distractor_irrigation",
+      "owner_label": "benchmark_owner",
+      "kind": "episodic",
+      "body": "A garden controller opened moisture valves in a fixed rotation after dawn.",
+      "summary": "Garden irrigation rotation",
+      "mechanism": "Moisture valves schedule irrigation zones.",
+      "tags": [
+        "coverage:cold_distractor",
+        "distractor:garden"
+      ],
+      "applicability": [
+        "soil probes are calibrated"
+      ],
+      "evidence": [
+        {
+          "type": "benchmark_observation",
+          "id": "garden-001"
+        }
+      ],
+      "falsifiers": [
+        "Dry zones receive no water during their scheduled rotation."
+      ],
+      "importance": 0.04,
+      "confidence": 0.05,
+      "target_temperature": "cold"
+    },
+    {
+      "label": "cold_distractor_ceramic",
+      "owner_label": "benchmark_owner",
+      "kind": "episodic",
+      "body": "A kiln ramp paused near peak temperature to change the crystal texture of a glaze.",
+      "summary": "Ceramic glaze firing pause",
+      "mechanism": "Kiln ramp timing controls glaze crystal formation.",
+      "tags": [
+        "coverage:cold_distractor",
+        "distractor:ceramic"
+      ],
+      "applicability": [
+        "the clay body tolerates the peak temperature"
+      ],
+      "evidence": [
+        {
+          "type": "benchmark_observation",
+          "id": "ceramic-001"
+        }
+      ],
+      "falsifiers": [
+        "The pause leaves crystal texture unchanged."
+      ],
+      "importance": 0.04,
+      "confidence": 0.05,
+      "target_temperature": "cold"
+    },
+    {
+      "label": "cold_distractor_orchestra",
+      "owner_label": "benchmark_owner",
+      "kind": "episodic",
+      "body": "Section leaders aligned tempo by listening for a shared acoustic pulse.",
+      "summary": "Orchestra tempo alignment",
+      "mechanism": "Acoustic cues synchronize section timing.",
+      "tags": [
+        "coverage:cold_distractor",
+        "distractor:orchestra"
+      ],
+      "applicability": [
+        "performers can hear the shared pulse"
+      ],
+      "evidence": [
+        {
+          "type": "benchmark_observation",
+          "id": "orchestra-001"
+        }
+      ],
+      "falsifiers": [
+        "Sections drift despite an audible shared pulse."
+      ],
+      "importance": 0.04,
+      "confidence": 0.05,
+      "target_temperature": "cold"
+    },
+    {
+      "label": "capsule_bounded_dispatch",
+      "owner_label": "alice",
+      "kind": "procedural",
+      "body": "Dispatchers admitted jobs only while bounded capacity remained, preventing a shared worker pool from collapsing.",
+      "summary": "Bounded dispatch protects shared workers",
+      "mechanism": "Admission tokens couple producer rate to available worker capacity.",
+      "tags": [
+        "coverage:operational_causality",
+        "propagation:source"
+      ],
+      "applicability": [
+        "worker capacity is measurable before admission"
+      ],
+      "evidence": [
+        {
+          "type": "benchmark_observation",
+          "id": "dispatch-001"
+        }
+      ],
+      "falsifiers": [
+        "Worker collapse occurs while admission remains below measured capacity."
+      ],
+      "importance": 0.7,
+      "confidence": 0.8,
+      "target_temperature": "warm"
+    },
+    {
+      "label": "orion_queue_feedback",
+      "owner_label": "benchmark_owner",
+      "kind": "semantic",
+      "body": "ORION queue admission lowered intake as saturation increased.",
+      "summary": "ORION queue admission response",
+      "mechanism": "ORION negative feedback threshold regulates queue intake.",
+      "tags": [
+        "coverage:counterfactual_applicability",
+        "coverage:distant_mechanism_analogy",
+        "inspiration:orion"
+      ],
+      "applicability": [
+        "ORION saturation measurement is current"
+      ],
+      "evidence": [
+        {
+          "type": "benchmark_observation",
+          "id": "orion-queue-001"
+        }
+      ],
+      "falsifiers": [
+        "ORION intake rises when saturation crosses the threshold."
+      ],
+      "importance": 0.68,
+      "confidence": 0.72,
+      "target_temperature": "warm"
+    },
+    {
+      "label": "orion_steam_feedback",
+      "owner_label": "benchmark_owner",
+      "kind": "semantic",
+      "body": "ORION steam relief increased as vessel pressure approached its limit.",
+      "summary": "ORION steam relief response",
+      "mechanism": "ORION negative feedback threshold regulates steam pressure.",
+      "tags": [
+        "coverage:counterfactual_applicability",
+        "coverage:distant_mechanism_analogy",
+        "inspiration:orion"
+      ],
+      "applicability": [
+        "ORION pressure sensor delay is bounded"
+      ],
+      "evidence": [
+        {
+          "type": "benchmark_observation",
+          "id": "orion-steam-001"
+        }
+      ],
+      "falsifiers": [
+        "ORION pressure rises after relief crosses the threshold."
+      ],
+      "importance": 0.68,
+      "confidence": 0.72,
+      "target_temperature": "warm"
+    },
+    {
+      "label": "orion_immune_feedback",
+      "owner_label": "benchmark_owner",
+      "kind": "semantic",
+      "body": "ORION immune checkpoints reduced inflammatory signaling after activation grew.",
+      "summary": "ORION immune checkpoint response",
+      "mechanism": "ORION negative feedback threshold regulates inflammation.",
+      "tags": [
+        "coverage:counterfactual_applicability",
+        "coverage:distant_mechanism_analogy",
+        "inspiration:orion"
+      ],
+      "applicability": [
+        "ORION checkpoint receptors remain responsive"
+      ],
+      "evidence": [
+        {
+          "type": "benchmark_observation",
+          "id": "orion-immune-001"
+        }
+      ],
+      "falsifiers": [
+        "ORION inflammation rises after checkpoint activation."
+      ],
+      "importance": 0.68,
+      "confidence": 0.72,
+      "target_temperature": "warm"
+    },
+    {
+      "label": "lyra_network_buffer",
+      "owner_label": "benchmark_owner",
+      "kind": "semantic",
+      "body": "LYRA network batching absorbed short traffic spikes before forwarding packets.",
+      "summary": "LYRA network spike absorber",
+      "mechanism": "LYRA buffer hysteresis separates fill and release thresholds.",
+      "tags": [
+        "coverage:counterfactual_applicability",
+        "coverage:distant_mechanism_analogy",
+        "inspiration:lyra"
+      ],
+      "applicability": [
+        "LYRA spikes are shorter than buffer drain time"
+      ],
+      "evidence": [
+        {
+          "type": "benchmark_observation",
+          "id": "lyra-network-001"
+        }
+      ],
+      "falsifiers": [
+        "LYRA forwarding oscillates between fill and release thresholds."
+      ],
+      "importance": 0.68,
+      "confidence": 0.72,
+      "target_temperature": "warm"
+    },
+    {
+      "label": "lyra_battery_buffer",
+      "owner_label": "benchmark_owner",
+      "kind": "semantic",
+      "body": "LYRA battery reserve absorbed renewable variation before serving demand.",
+      "summary": "LYRA battery variation absorber",
+      "mechanism": "LYRA buffer hysteresis separates charge and discharge thresholds.",
+      "tags": [
+        "coverage:counterfactual_applicability",
+        "coverage:distant_mechanism_analogy",
+        "inspiration:lyra"
+      ],
+      "applicability": [
+        "LYRA reserve exceeds one variation interval"
+      ],
+      "evidence": [
+        {
+          "type": "benchmark_observation",
+          "id": "lyra-battery-001"
+        }
+      ],
+      "falsifiers": [
+        "LYRA storage chatters between charge and discharge thresholds."
+      ],
+      "importance": 0.68,
+      "confidence": 0.72,
+      "target_temperature": "warm"
+    },
+    {
+      "label": "lyra_inventory_buffer",
+      "owner_label": "benchmark_owner",
+      "kind": "semantic",
+      "body": "LYRA reserve stock absorbed supplier variation before assembly stopped.",
+      "summary": "LYRA inventory variation absorber",
+      "mechanism": "LYRA buffer hysteresis separates reorder and release thresholds.",
+      "tags": [
+        "coverage:counterfactual_applicability",
+        "coverage:distant_mechanism_analogy",
+        "inspiration:lyra"
+      ],
+      "applicability": [
+        "LYRA replenishment lead time is observable"
+      ],
+      "evidence": [
+        {
+          "type": "benchmark_observation",
+          "id": "lyra-inventory-001"
+        }
+      ],
+      "falsifiers": [
+        "LYRA inventory chatters around reorder and release thresholds."
+      ],
+      "importance": 0.68,
+      "confidence": 0.72,
+      "target_temperature": "warm"
+    },
+    {
+      "label": "nova_database_quorum",
+      "owner_label": "benchmark_owner",
+      "kind": "semantic",
+      "body": "NOVA replicas committed after a majority confirmed the same log position.",
+      "summary": "NOVA database majority confirmation",
+      "mechanism": "NOVA redundant quorum masks one failing participant.",
+      "tags": [
+        "coverage:counterfactual_applicability",
+        "coverage:distant_mechanism_analogy",
+        "inspiration:nova"
+      ],
+      "applicability": [
+        "NOVA failures remain below quorum tolerance"
+      ],
+      "evidence": [
+        {
+          "type": "benchmark_observation",
+          "id": "nova-database-001"
+        }
+      ],
+      "falsifiers": [
+        "NOVA commits diverge while a majority is reachable."
+      ],
+      "importance": 0.68,
+      "confidence": 0.72,
+      "target_temperature": "warm"
+    },
+    {
+      "label": "nova_sensor_quorum",
+      "owner_label": "benchmark_owner",
+      "kind": "semantic",
+      "body": "NOVA sensors accepted a reading after a majority agreed within tolerance.",
+      "summary": "NOVA sensor majority confirmation",
+      "mechanism": "NOVA redundant quorum masks one drifting participant.",
+      "tags": [
+        "coverage:counterfactual_applicability",
+        "coverage:distant_mechanism_analogy",
+        "inspiration:nova"
+      ],
+      "applicability": [
+        "NOVA sensor errors are independent"
+      ],
+      "evidence": [
+        {
+          "type": "benchmark_observation",
+          "id": "nova-sensor-001"
+        }
+      ],
+      "falsifiers": [
+        "NOVA majority readings drift together outside tolerance."
+      ],
+      "importance": 0.68,
+      "confidence": 0.72,
+      "target_temperature": "warm"
+    },
+    {
+      "label": "nova_review_quorum",
+      "owner_label": "benchmark_owner",
+      "kind": "semantic",
+      "body": "NOVA reviewers approved a release after independent checks reached a majority.",
+      "summary": "NOVA review majority confirmation",
+      "mechanism": "NOVA redundant quorum masks one mistaken participant.",
+      "tags": [
+        "coverage:counterfactual_applicability",
+        "coverage:distant_mechanism_analogy",
+        "inspiration:nova"
+      ],
+      "applicability": [
+        "NOVA reviewers inspect independently"
+      ],
+      "evidence": [
+        {
+          "type": "benchmark_observation",
+          "id": "nova-review-001"
+        }
+      ],
+      "falsifiers": [
+        "NOVA majority approval repeats one shared review error."
+      ],
+      "importance": 0.68,
+      "confidence": 0.72,
+      "target_temperature": "warm"
+    },
+    {
+      "label": "zenith_trace_sampling",
+      "owner_label": "benchmark_owner",
+      "kind": "semantic",
+      "body": "ZENITH tracing increased capture around rare latency spikes.",
+      "summary": "ZENITH trace anomaly capture",
+      "mechanism": "ZENITH adaptive sampling allocates observations by surprise.",
+      "tags": [
+        "coverage:counterfactual_applicability",
+        "coverage:distant_mechanism_analogy",
+        "inspiration:zenith"
+      ],
+      "applicability": [
+        "ZENITH surprise scores arrive before traces expire"
+      ],
+      "evidence": [
+        {
+          "type": "benchmark_observation",
+          "id": "zenith-trace-001"
+        }
+      ],
+      "falsifiers": [
+        "ZENITH rare spikes receive fewer observations than routine traffic."
+      ],
+      "importance": 0.68,
+      "confidence": 0.72,
+      "target_temperature": "warm"
+    },
+    {
+      "label": "zenith_quality_sampling",
+      "owner_label": "benchmark_owner",
+      "kind": "semantic",
+      "body": "ZENITH inspection increased checks around unusual production defects.",
+      "summary": "ZENITH defect anomaly capture",
+      "mechanism": "ZENITH adaptive sampling allocates inspections by surprise.",
+      "tags": [
+        "coverage:counterfactual_applicability",
+        "coverage:distant_mechanism_analogy",
+        "inspiration:zenith"
+      ],
+      "applicability": [
+        "ZENITH defect signals arrive before the batch closes"
+      ],
+      "evidence": [
+        {
+          "type": "benchmark_observation",
+          "id": "zenith-quality-001"
+        }
+      ],
+      "falsifiers": [
+        "ZENITH unusual defects receive fewer checks than routine products."
+      ],
+      "importance": 0.68,
+      "confidence": 0.72,
+      "target_temperature": "warm"
+    },
+    {
+      "label": "zenith_ecology_sampling",
+      "owner_label": "benchmark_owner",
+      "kind": "semantic",
+      "body": "ZENITH field surveys increased observations around unusual habitat changes.",
+      "summary": "ZENITH habitat anomaly capture",
+      "mechanism": "ZENITH adaptive sampling allocates surveys by surprise.",
+      "tags": [
+        "coverage:counterfactual_applicability",
+        "coverage:distant_mechanism_analogy",
+        "inspiration:zenith"
+      ],
+      "applicability": [
+        "ZENITH habitat signals arrive before survey teams move"
+      ],
+      "evidence": [
+        {
+          "type": "benchmark_observation",
+          "id": "zenith-ecology-001"
+        }
+      ],
+      "falsifiers": [
+        "ZENITH unusual habitats receive fewer surveys than stable sites."
+      ],
+      "importance": 0.68,
+      "confidence": 0.72,
+      "target_temperature": "warm"
+    }
+  ]
+}
