@@ -1,0 +1,93 @@
+"""Durable SQLite storage infrastructure."""
+
+from experience_hub.storage.database import (
+    Database,
+    DatabaseBusy,
+    is_sqlite_lock_error,
+)
+from experience_hub.storage.event_store import EventStore
+from experience_hub.storage.idempotency import (
+    CommandExecutor,
+    CommandHandler,
+    CommandResult,
+    CompletedReceipt,
+    IdempotencyIntegrityError,
+    IdempotencyKeyConflict,
+    InProgressReceipt,
+    NewReceipt,
+    ReceiptDecision,
+    ReceiptRecord,
+    ReceiptReservation,
+    ReceiptStore,
+    StoredResponse,
+)
+from experience_hub.storage.projection_contracts import (
+    ProjectionApplier,
+    ProjectionReducer,
+)
+from experience_hub.storage.projections import (
+    EventHeadChanged,
+    MaintenanceBlockedByInflight,
+    ProjectionDiff,
+    ProjectionManager,
+    ProjectionMismatch,
+    ProjectionRegistry,
+    ReducerVersionMismatch,
+    SourceValidatorRequired,
+    VerificationReport,
+)
+from experience_hub.storage.unit_of_work import UnitOfWork
+from experience_hub.storage.validation import (
+    AgentSourceValidator,
+    ExperienceSourceValidator,
+    InspirationSourceValidator,
+    PayloadReconcileValidationError,
+    SourceIntegrityError,
+    SourceValidationHook,
+    SourceValidator,
+    register_agent_source_validator,
+    register_experience_source_validator,
+    register_inspiration_source_validator,
+)
+
+__all__ = [
+    "AgentSourceValidator",
+    "CommandExecutor",
+    "CommandHandler",
+    "CommandResult",
+    "CompletedReceipt",
+    "Database",
+    "DatabaseBusy",
+    "EventHeadChanged",
+    "EventStore",
+    "ExperienceSourceValidator",
+    "InspirationSourceValidator",
+    "IdempotencyIntegrityError",
+    "IdempotencyKeyConflict",
+    "InProgressReceipt",
+    "MaintenanceBlockedByInflight",
+    "NewReceipt",
+    "PayloadReconcileValidationError",
+    "ProjectionApplier",
+    "ProjectionDiff",
+    "ProjectionManager",
+    "ProjectionMismatch",
+    "ProjectionReducer",
+    "ProjectionRegistry",
+    "ReceiptDecision",
+    "ReceiptRecord",
+    "ReceiptReservation",
+    "ReceiptStore",
+    "ReducerVersionMismatch",
+    "SourceIntegrityError",
+    "SourceValidationHook",
+    "SourceValidator",
+    "SourceValidatorRequired",
+    "StoredResponse",
+    "UnitOfWork",
+    "VerificationReport",
+    "register_agent_source_validator",
+    "register_experience_source_validator",
+    "register_inspiration_source_validator",
+    "is_sqlite_lock_error",
+]
