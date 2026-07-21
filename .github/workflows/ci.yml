@@ -13,29 +13,142 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  UV_VERSION: "0.11.16"
+  PYTHON_VERSION: "3.12"
+
 jobs:
-  test:
+  quality:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 8
     steps:
       - name: Check out source
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-      - name: Install uv
-        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          version: "0.8.18"
+          persist-credentials: false
+      - name: Install uv
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          version: ${{ env.UV_VERSION }}
           enable-cache: true
       - name: Install Python
-        run: uv python install 3.12
+        run: uv python install ${{ env.PYTHON_VERSION }}
       - name: Sync dependencies
         run: uv sync --all-groups --frozen
+      - name: Verify lockfile
+        run: uv lock --check
       - name: Lint
         run: uv run ruff check .
       - name: Type check
         run: uv run mypy src
-      - name: Test
-        run: uv run pytest -q
-      - name: Demo
+
+  tests:
+    name: tests (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: core
+            paths: tests/unit tests/integration tests/contract
+          - name: persistence
+            paths: tests/repository
+          - name: surfaces
+            paths: tests/api tests/cli
+          - name: scenarios
+            paths: tests/e2e tests/benchmark
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install uv
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+      - name: Install Python
+        run: uv python install ${{ env.PYTHON_VERSION }}
+      - name: Sync dependencies
+        run: uv sync --all-groups --frozen
+      - name: Run ${{ matrix.name }} tests
+        run: uv run pytest --no-cov -q ${{ matrix.paths }}
+
+  demo:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install uv
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+      - name: Install Python
+        run: uv python install ${{ env.PYTHON_VERSION }}
+      - name: Sync dependencies
+        run: uv sync --all-groups --frozen
+      - name: Run deterministic demo
         run: uv run experience-hub demo --reset
-      - name: Benchmark
+
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install uv
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+      - name: Install Python
+        run: uv python install ${{ env.PYTHON_VERSION }}
+      - name: Sync dependencies
+        run: uv sync --all-groups --frozen
+      - name: Run deterministic benchmark
         run: uv run experience-hub benchmark
+
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install uv
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+      - name: Install Python
+        run: uv python install ${{ env.PYTHON_VERSION }}
+      - name: Sync dependencies
+        run: uv sync --all-groups --frozen
+      - name: Build packages
+        run: uv build
+      - name: Inspect archives
+        run: |
+          uv run python -m zipfile --test dist/*.whl
+          tar -tzf dist/*.tar.gz >/dev/null
+      - name: Record and verify artifact digests
+        run: |
+          LC_ALL=C sha256sum dist/*.whl dist/*.tar.gz > dist/SHA256SUMS
+          sha256sum --check dist/SHA256SUMS
+      - name: Upload release candidate
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: experience-hub-release-candidate
+          path: |
+            dist/*.whl
+            dist/*.tar.gz
+            dist/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 14
