@@ -13,6 +13,7 @@ from typing import Any
 from uuid import UUID
 
 import pytest
+from click import unstyle
 from typer.testing import CliRunner
 
 import experience_hub.runtime as runtime_module
@@ -163,15 +164,20 @@ def _install_runtime_probe(
     return observations
 
 
-def test_lifecycle_help_exposes_run_database_and_evaluation_time() -> None:
+def test_lifecycle_help_exposes_run_database_and_evaluation_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.setenv("CLICOLOR_FORCE", "1")
     group = RUNNER.invoke(app, ["lifecycle", "--help"])
     command = RUNNER.invoke(app, ["lifecycle", "run", "--help"])
+    plain_command = unstyle(command.output)
 
     assert group.exit_code == 0, group.output
-    assert "run" in group.output
+    assert "run" in unstyle(group.output)
     assert command.exit_code == 0, command.output
-    assert "--database" in command.output
-    assert "--evaluated-at" in command.output
+    assert "--database" in plain_command
+    assert "--evaluated-at" in plain_command
 
 
 def test_lifecycle_run_uses_shared_runtime_and_the_ordinary_executor(

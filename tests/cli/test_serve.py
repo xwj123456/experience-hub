@@ -6,6 +6,7 @@ from typing import cast
 
 import pytest
 import uvicorn
+from click import unstyle
 from fastapi import FastAPI
 from typer import Typer
 from typer.testing import CliRunner
@@ -53,20 +54,27 @@ def test_every_planned_command_has_help(arguments: tuple[str, ...]) -> None:
     assert result.exit_code == 0, result.output
 
 
-def test_demo_help_exposes_reset_option() -> None:
+def test_demo_help_exposes_reset_option(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.setenv("CLICOLOR_FORCE", "1")
     result = RUNNER.invoke(app, ["demo", "--help"])
 
     assert result.exit_code == 0, result.output
-    assert "--reset" in result.output
+    assert "--reset" in unstyle(result.output)
 
 
-def test_serve_help_locks_host_port_and_database_options() -> None:
+def test_serve_help_locks_host_port_and_database_options(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.setenv("CLICOLOR_FORCE", "1")
     result = RUNNER.invoke(app, ["serve", "--help"])
+    plain_output = unstyle(result.output)
 
     assert result.exit_code == 0, result.output
-    assert "--host" in result.output
-    assert "--port" in result.output
-    assert "--database" in result.output
+    assert "--host" in plain_output
+    assert "--port" in plain_output
+    assert "--database" in plain_output
 
 
 def test_serve_passes_a_lazy_database_bound_factory_to_uvicorn(
