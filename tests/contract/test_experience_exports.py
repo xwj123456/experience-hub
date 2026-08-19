@@ -8,8 +8,20 @@ from typing import get_type_hints
 from uuid import UUID
 
 import pytest
+from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from experience_hub.domain import CommandContext
+from experience_hub.experiences.candidate_models import (
+    AdoptCandidate,
+    CandidateDecision,
+    RejectCandidate,
+)
+from experience_hub.experiences.candidate_service import (
+    CandidatePageV1,
+    CandidateService,
+    CandidateViewV1,
+)
 from experience_hub.experiences.contracts import (
     ConfirmExperience,
     CreateExperience,
@@ -91,9 +103,15 @@ from experience_hub.retrieval.service import (
     RetrievalService,
     retrieval_query_hash,
 )
+from experience_hub.storage import StoredResponse, UnitOfWork
 
 EXPECTED_EXPORTS: dict[str, dict[str, object]] = {
     "experience_hub.experiences": {
+        "AdoptCandidate": AdoptCandidate,
+        "CandidateDecision": CandidateDecision,
+        "CandidatePageV1": CandidatePageV1,
+        "CandidateService": CandidateService,
+        "CandidateViewV1": CandidateViewV1,
         "ConfirmExperience": ConfirmExperience,
         "CreateExperience": CreateExperience,
         "CreateExperienceVersion": CreateExperienceVersion,
@@ -115,6 +133,7 @@ EXPECTED_EXPORTS: dict[str, dict[str, object]] = {
         "PinExperience": PinExperience,
         "RefuteExperience": RefuteExperience,
         "RestoreExperience": RestoreExperience,
+        "RejectCandidate": RejectCandidate,
         "ShareableExperienceVersion": ShareableExperienceVersion,
         "Temperature": Temperature,
         "UnpinExperience": UnpinExperience,
@@ -219,7 +238,8 @@ def test_feature_packages_import_in_any_order_in_a_fresh_interpreter(
             "from importlib import import_module",
             *(f"import_module({module_name!r})" for module_name in module_order),
             "from experience_hub.experiences import ("
-            "ExperienceQuery, ExperienceStateSnapshotV1, "
+            "AdoptCandidate, CandidateService, ExperienceQuery, "
+            "ExperienceStateSnapshotV1, RejectCandidate, "
             "ShareableExperienceVersion)",
             "from experience_hub.retrieval import ("
             "ExperienceEvidenceReader, PeekExperiences, SearchResult)",
@@ -285,3 +305,56 @@ def test_evidence_reader_keeps_its_read_only_session_contract() -> None:
         "query": PeekExperiences,
         "return": SearchResult,
     }
+
+
+@pytest.mark.parametrize(
+    ("method_name", "request_type"),
+    (("adopt", AdoptCandidate), ("reject", RejectCandidate)),
+)
+def test_candidate_decisions_keep_transaction_bound_contracts(
+    method_name: str,
+    request_type: type[AdoptCandidate] | type[RejectCandidate],
+) -> None:
+    method = getattr(CandidateService, method_name)
+    signature = inspect.signature(method)
+
+    assert inspect.iscoroutinefunction(method)
+    assert tuple(signature.parameters) == ("self", "uow", "request", "command")
+    assert all(
+        parameter.kind is inspect.Parameter.KEYWORD_ONLY
+        for name, parameter in signature.parameters.items()
+        if name != "self"
+    )
+    assert get_type_hints(method) == {
+        "uow": UnitOfWork,
+        "request": request_type,
+        "command": CommandContext,
+        "return": StoredResponse,
+    }
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("importance", True),
+        ("importance", -0.01),
+        ("importance", float("nan")),
+        ("confidence", "0.5"),
+        ("confidence", 1.01),
+        ("confidence", float("inf")),
+    ),
+)
+def test_adopt_candidate_rejects_non_finite_or_out_of_range_scores(
+    field: str,
+    value: object,
+) -> None:
+    values: dict[str, object] = {
+        "owner_agent_id": UUID(int=1),
+        "candidate_id": UUID(int=2),
+        "importance": 0.5,
+        "confidence": 0.5,
+    }
+    values[field] = value
+
+    with pytest.raises(ValidationError):
+        AdoptCandidate.model_validate(values)

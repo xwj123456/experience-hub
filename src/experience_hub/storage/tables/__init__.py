@@ -1,6 +1,13 @@
 """SQLAlchemy metadata for durable core tables."""
 
 from experience_hub.storage.tables.base import Base
+from experience_hub.storage.tables.capture import (
+    CandidateAdoptionRow,
+    CandidateStateRow,
+    ExperienceCandidateRow,
+    TrajectoryBundleRow,
+    TrajectoryEvidenceRow,
+)
 from experience_hub.storage.tables.core import (
     AgentRow,
     DomainEventRow,
@@ -44,8 +51,11 @@ __all__ = [
     "Base",
     "CapsuleFeedbackRow",
     "CapsuleStateRow",
+    "CandidateAdoptionRow",
+    "CandidateStateRow",
     "DomainEventRow",
     "ExperienceCapsuleRow",
+    "ExperienceCandidateRow",
     "ExperienceLinkRow",
     "ExperiencePayloadRow",
     "ExperienceRow",
@@ -66,4 +76,6 @@ __all__ = [
     "ProjectionVersionRow",
     "SubscriptionRow",
     "TopicRow",
+    "TrajectoryBundleRow",
+    "TrajectoryEvidenceRow",
 ]

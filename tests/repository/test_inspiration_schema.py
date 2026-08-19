@@ -772,7 +772,7 @@ def test_falsifiers_upgrade_preserves_existing_0004_snapshot_rows(
             ) == canonical_json_bytes([])
             assert (
                 connection.scalar(text("SELECT version_num FROM alembic_version"))
-                == "0005_inspiration_falsifiers"
+                == "0007_capture_evidence_hashes"
             )
     finally:
         upgraded.dispose()
@@ -847,7 +847,7 @@ def test_falsifiers_upgrade_accepts_the_pre_fix_0004_column(
             ) == legacy_falsifiers
             assert (
                 connection.scalar(text("SELECT version_num FROM alembic_version"))
-                == "0005_inspiration_falsifiers"
+                == "0007_capture_evidence_hashes"
             )
             assert (
                 connection.scalar(
@@ -915,7 +915,7 @@ def test_falsifiers_migration_supports_only_safe_offline_upgrade_sql(
     )
     upgrade_sql = StringIO()
     config.output_buffer = upgrade_sql
-    command.upgrade(config, "head", sql=True)
+    command.upgrade(config, "0005_inspiration_falsifiers", sql=True)
     assert "ADD COLUMN falsifiers" in upgrade_sql.getvalue()
 
     downgrade_sql = StringIO()

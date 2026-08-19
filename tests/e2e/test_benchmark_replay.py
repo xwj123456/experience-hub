@@ -50,6 +50,7 @@ def test_benchmark_replays_from_exact_snapshot_and_passes_every_gate(
     data = cast(dict[str, Any], report["data"])
     assert data["passed"] is True
     assert data["failed_gates"] == []
+    assert len(data["gates"]) == 11
     assert all(gate["passed"] is True for gate in data["gates"])
     assert data["metrics"]["byte_identical_replay"] is True
     assert data["metrics"]["inspiration_evidence_coverage_failure_count"] == 0

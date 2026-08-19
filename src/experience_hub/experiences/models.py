@@ -28,6 +28,7 @@ class ExperienceOrigin(StrEnum):
     LOCAL = "local"
     ADOPTED_CAPSULE = "adopted_capsule"
     ADOPTED_IDEA = "adopted_idea"
+    ADOPTED_CANDIDATE = "adopted_candidate"
 
 
 class Temperature(StrEnum):

@@ -59,7 +59,8 @@ class ExperienceRow(Base):
             name="ck_experiences_kind",
         ),
         CheckConstraint(
-            "origin IN ('local', 'adopted_capsule', 'adopted_idea')",
+            "origin IN ('local','adopted_capsule','adopted_idea',"
+            "'adopted_candidate')",
             name="ck_experiences_origin",
         ),
         Index(
@@ -67,6 +68,12 @@ class ExperienceRow(Base):
             "owner_agent_id",
             "created_at",
             "experience_id",
+        ),
+        Index(
+            "ux_experiences_id_owner",
+            "experience_id",
+            "owner_agent_id",
+            unique=True,
         ),
     )
 
@@ -133,6 +140,13 @@ class ExperienceVersionRow(Base):
         Index(
             "ix_experience_versions_supersedes",
             "supersedes_version_id",
+        ),
+        Index(
+            "ux_experience_versions_id_experience_content",
+            "version_id",
+            "experience_id",
+            "content_hash",
+            unique=True,
         ),
     )
 

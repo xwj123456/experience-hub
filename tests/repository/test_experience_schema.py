@@ -668,7 +668,7 @@ def test_ledger_only_experience_downgrade_stops_after_empty_newer_schema(
                 text("SELECT version_num FROM alembic_version")
             )
         assert after_event == before_event
-        assert before_version == "0005_inspiration_falsifiers"
+        assert before_version == "0007_capture_evidence_hashes"
         assert after_version == "0002_experiences"
     finally:
         verification_engine.dispose()

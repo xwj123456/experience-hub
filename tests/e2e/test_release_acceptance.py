@@ -24,6 +24,7 @@ from experience_hub.canonical import canonical_json_bytes
 from experience_hub.cli import app
 from experience_hub.config import Settings
 from experience_hub.domain import CommandRequest
+from experience_hub.release_evidence.contracts import ReleaseEvidenceReportV1
 
 PROJECT_ROOT = Path(__file__).parents[2]
 RUNNER = CliRunner()
@@ -342,6 +343,41 @@ def test_release_candidate_acceptance(
     reconcile_data = cast(dict[str, Any], reconciled["data"])
     assert reconcile_data["error_count"] == 0
     assert reconcile_data["errors"] == []
+
+
+def test_checked_in_release_evidence_matches_stable_runtime_summaries() -> None:
+    evidence_path = PROJECT_ROOT / "docs" / "evidence" / "release-evidence.json"
+    body = evidence_path.read_bytes()
+    evidence = ReleaseEvidenceReportV1.model_validate_json(body, strict=True)
+
+    assert canonical_json_bytes(evidence) == body
+
+    demo = _canonical_cli_document(RUNNER.invoke(app, ["demo", "--reset"]))
+    demo_data = cast(dict[str, Any], demo["data"])
+    assert evidence.data.demo.all_invariants_hold is True
+    assert evidence.data.demo.stage_count == len(
+        cast(list[dict[str, Any]], demo_data["stages"])
+    )
+
+    benchmark = _canonical_cli_document(RUNNER.invoke(app, ["benchmark"]))
+    benchmark_data = cast(dict[str, Any], benchmark["data"])
+    gates = cast(list[dict[str, Any]], benchmark_data["gates"])
+    assert evidence.data.benchmark.passed is benchmark_data["passed"]
+    assert evidence.data.benchmark.case_count == len(
+        cast(list[dict[str, Any]], benchmark_data["cases"])
+    )
+    assert evidence.data.benchmark.gate_count == len(gates)
+    assert evidence.data.benchmark.passed_gate_count == sum(
+        gate["passed"] is True for gate in gates
+    )
+    assert evidence.data.benchmark.byte_identical_replay is (
+        cast(dict[str, Any], benchmark_data["metrics"])["byte_identical_replay"]
+    )
+    assert evidence.data.benchmark.pending_capsule_leakage_count == (
+        cast(dict[str, Any], benchmark_data["metrics"])[
+            "pending_capsule_leakage_count"
+        ]
+    )
 
 def _unused_loopback_port() -> int:
     with closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as listener:

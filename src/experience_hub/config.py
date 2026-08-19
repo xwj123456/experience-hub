@@ -3,6 +3,8 @@
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from sqlalchemy.engine import URL
+
 
 def repository_root(start: Path | None = None) -> Path:
     """Return the nearest ancestor containing this project's ``pyproject.toml``."""
@@ -20,7 +22,7 @@ def repository_root(start: Path | None = None) -> Path:
 class Settings:
     """Runtime settings with a repository-relative SQLite default."""
 
-    database_url: str | None = None
+    database_url: str | URL | None = None
     openai_compatible_base_url: str | None = None
     openai_compatible_model: str | None = None
     openai_compatible_api_key: str | None = field(default=None, repr=False)

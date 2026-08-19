@@ -11,6 +11,7 @@ from contextlib import (
 from typing import Any
 
 from sqlalchemy import event, text
+from sqlalchemy.engine import URL
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import (
     AsyncConnection,
@@ -102,7 +103,7 @@ class Database:
     @classmethod
     def create(
         cls,
-        url: str,
+        url: str | URL,
         *,
         event_registry: EventRegistry | None = None,
         projection_applier: ProjectionApplier | None = None,
