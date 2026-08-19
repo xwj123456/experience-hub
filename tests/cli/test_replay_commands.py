@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, cast
 
 import pytest
+from click import unstyle
 from typer.testing import CliRunner
 
 import experience_hub.config as config
@@ -72,7 +73,7 @@ def test_replay_help_exposes_inspect_run_and_verify() -> None:
     result = RUNNER.invoke(app, ["replay", "--help"])
 
     assert result.exit_code == 0, result.output
-    assert {"inspect", "run", "verify"} <= set(result.output.split())
+    assert {"inspect", "run", "verify"} <= set(unstyle(result.output).split())
 
 
 def test_committed_smoke_fixture_is_exact_and_canonical() -> None:
