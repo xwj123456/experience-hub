@@ -126,6 +126,13 @@ def test_quality_job_verifies_release_evidence_after_static_checks() -> None:
     ) < quality_job.index("uv run experience-hub release verify")
 
 
+def test_quality_release_verification_checks_out_complete_history() -> None:
+    quality_job = _workflow_job(_workflow("ci.yml"), "quality")
+    checkout_step = quality_job[: quality_job.index("      - name: Install uv")]
+
+    assert "          fetch-depth: 0\n" in checkout_step
+
+
 def test_quality_job_does_not_match_release_verify_in_another_job() -> None:
     workflow = _workflow("ci.yml")
     release_step = (
