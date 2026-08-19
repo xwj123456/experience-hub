@@ -41,6 +41,8 @@ dist/
 *.egg-info/
 .venv/
 venv/
+.internal/
+.worktrees/
 
 # Local editor metadata.
 .idea/

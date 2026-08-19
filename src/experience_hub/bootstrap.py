@@ -7,9 +7,18 @@ from dataclasses import dataclass, field
 
 from experience_hub.agents.events import register_agent_events
 from experience_hub.agents.service import AgentService
+from experience_hub.capture.extraction import DeterministicSignalExtractor
+from experience_hub.capture.jsonl import GenericJsonlAdapter
+from experience_hub.capture.sanitization import DefaultSecretScanner
+from experience_hub.capture.service import CapturePreparer, CaptureService
+from experience_hub.capture.validation import register_capture_source_validator
 from experience_hub.clock import Clock, SystemClock
 from experience_hub.config import Settings
 from experience_hub.domain.events import EventRegistry
+from experience_hub.experiences.candidate_events import register_candidate_events
+from experience_hub.experiences.candidate_projector import CandidateStateProjector
+from experience_hub.experiences.candidate_repository import CandidateRepository
+from experience_hub.experiences.candidate_service import CandidateService
 from experience_hub.experiences.projector import (
     ExperienceProjector,
     ExperienceTermsProjector,
@@ -108,6 +117,10 @@ class ApplicationContainer:
     database: Database
     receipt_store: ReceiptStore
     command_executor: CommandExecutor
+    capture_preparer: CapturePreparer
+    capture_service: CaptureService
+    candidate_repository: CandidateRepository
+    candidate_service: CandidateService
     experience_repository: ExperienceRepository
     experience_query: ExperienceQuery
     experience_writer: ExperienceWriter
@@ -187,12 +200,14 @@ class ApplicationContainer:
         from experience_hub.inspiration.events import register_inspiration_events
 
         register_experience_events(event_registry)
+        register_candidate_events(event_registry)
         register_sharing_events(event_registry)
         register_inspiration_events(event_registry)
 
         source_validator = SourceValidator(event_registry)
         register_agent_source_validator(source_validator)
         register_experience_source_validator(source_validator)
+        register_capture_source_validator(source_validator)
         register_sharing_source_validator(source_validator)
         register_inspiration_source_validator(source_validator)
 
@@ -200,6 +215,7 @@ class ApplicationContainer:
             (
                 ExperienceProjector(event_registry, retained_lifecycle_config),
                 ExperienceTermsProjector(event_registry),
+                CandidateStateProjector(event_registry),
                 CapsuleStateProjector(event_registry),
                 AgentReputationProjector(event_registry),
                 InboxItemProjector(event_registry),
@@ -229,6 +245,17 @@ class ApplicationContainer:
             receipt_store=receipt_store,
             clock=retained_clock,
         )
+        capture_preparer = CapturePreparer(
+            adapter=GenericJsonlAdapter(),
+            scanner=DefaultSecretScanner(),
+            extractor=DeterministicSignalExtractor(),
+        )
+        capture_service = CaptureService(
+            clock=retained_clock,
+            id_generator=retained_ids,
+            receipt_store=receipt_store,
+        )
+        candidate_repository = CandidateRepository()
 
         experience_repository = ExperienceRepository(event_registry=event_registry)
         experience_query = ExperienceQuery(event_registry=event_registry)
@@ -236,6 +263,13 @@ class ApplicationContainer:
             id_generator=retained_ids,
             repository=experience_repository,
             lifecycle_config=retained_lifecycle_config,
+        )
+        candidate_service = CandidateService(
+            repository=candidate_repository,
+            experience_writer=experience_writer,
+            receipt_store=receipt_store,
+            clock=retained_clock,
+            id_generator=retained_ids,
         )
         experience_mutation_writer = ExperienceMutationWriter(
             repository=experience_repository,
@@ -353,6 +387,10 @@ class ApplicationContainer:
             database=database,
             receipt_store=receipt_store,
             command_executor=command_executor,
+            capture_preparer=capture_preparer,
+            capture_service=capture_service,
+            candidate_repository=candidate_repository,
+            candidate_service=candidate_service,
             experience_repository=experience_repository,
             experience_query=experience_query,
             experience_writer=experience_writer,

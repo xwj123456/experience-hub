@@ -8,6 +8,7 @@ from experience_hub.runtime import ApplicationRuntime
 
 EXPECTED_REDUCER_VERSIONS = {
     "agent_reputation": 1,
+    "candidate_state": 1,
     "capsule_state": 1,
     "experience_state": 1,
     "experience_terms": 1,
@@ -35,7 +36,7 @@ def test_health_becomes_ready_after_real_runtime_initialization(
     assert response.json() == {
         "data": {
             "reducer_versions": EXPECTED_REDUCER_VERSIONS,
-            "schema_revision": "0005_inspiration_falsifiers",
+            "schema_revision": "0007_capture_evidence_hashes",
             "status": "ready",
             "version": "0.1.0",
         }

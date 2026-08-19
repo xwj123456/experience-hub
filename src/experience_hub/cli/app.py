@@ -18,7 +18,10 @@ from sqlalchemy.engine import make_url
 from experience_hub.api.app import create_app
 from experience_hub.benchmark.runner import run_benchmark
 from experience_hub.canonical import canonical_json_bytes
+from experience_hub.cli.capture_commands import candidate_app, capture_app
 from experience_hub.cli.demo import build_demo_report
+from experience_hub.cli.release_commands import release_app
+from experience_hub.cli.replay_commands import replay_app
 from experience_hub.clock import require_utc
 from experience_hub.config import Settings
 from experience_hub.domain import CommandContext, CommandRequest
@@ -71,6 +74,10 @@ payloads_app = typer.Typer(
 app.add_typer(lifecycle_app, name="lifecycle")
 app.add_typer(projections_app, name="projections")
 app.add_typer(payloads_app, name="payloads")
+app.add_typer(capture_app, name="capture")
+app.add_typer(candidate_app, name="candidates")
+app.add_typer(replay_app, name="replay")
+app.add_typer(release_app, name="release")
 
 _RFC3339_TIMESTAMP = re.compile(
     r"^\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}"

@@ -23,6 +23,14 @@ from experience_hub.experiences.models import (
 )
 
 if TYPE_CHECKING:
+    from experience_hub.experiences.candidate_models import (
+        AdoptCandidate,
+        CandidateDecision,
+        CandidatePageV1,
+        CandidateViewV1,
+        RejectCandidate,
+    )
+    from experience_hub.experiences.candidate_service import CandidateService
     from experience_hub.experiences.contracts import (
         ConfirmExperience,
         CreateExperience,
@@ -72,6 +80,18 @@ _LAZY_CONTRACT_EXPORTS = frozenset(
         "canonicalize_version_links",
     }
 )
+_LAZY_CANDIDATE_MODEL_EXPORTS = frozenset(
+    {
+        "AdoptCandidate",
+        "CandidateDecision",
+        "CandidatePageV1",
+        "CandidateViewV1",
+        "RejectCandidate",
+    }
+)
+_LAZY_CANDIDATE_SERVICE_EXPORTS = frozenset(
+    {"CandidateService"}
+)
 _LAZY_EVENT_EXPORTS = frozenset({"ExperienceStateSnapshotV1"})
 _LAZY_QUERY_EXPORTS = frozenset(
     {"ExperienceNotFoundError", "ExperienceQuery"}
@@ -84,6 +104,14 @@ _LAZY_SERVICE_EXPORTS = frozenset(
 )
 _LAZY_TRANSITION_EXPORTS = frozenset({"ExperienceMutationWriter"})
 _LAZY_EXPORT_MODULES = {
+    **{
+        name: "experience_hub.experiences.candidate_models"
+        for name in _LAZY_CANDIDATE_MODEL_EXPORTS
+    },
+    **{
+        name: "experience_hub.experiences.candidate_service"
+        for name in _LAZY_CANDIDATE_SERVICE_EXPORTS
+    },
     **{
         name: "experience_hub.experiences.contracts"
         for name in _LAZY_CONTRACT_EXPORTS
@@ -121,6 +149,11 @@ def __getattr__(name: str) -> Any:
 
 
 __all__ = [
+    "AdoptCandidate",
+    "CandidateDecision",
+    "CandidatePageV1",
+    "CandidateService",
+    "CandidateViewV1",
     "ConfirmExperience",
     "CreateExperience",
     "CreateExperienceVersion",
@@ -143,6 +176,7 @@ __all__ = [
     "PayloadCodec",
     "PinExperience",
     "RefuteExperience",
+    "RejectCandidate",
     "RestoreExperience",
     "ShareableExperienceVersion",
     "Temperature",

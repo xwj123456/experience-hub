@@ -7,9 +7,11 @@ from uuid import UUID
 
 import pytest
 from sqlalchemy import text
+from sqlalchemy.engine import URL
 
 from experience_hub.bootstrap import ApplicationContainer
 from experience_hub.config import Settings
+from experience_hub.experiences.candidate_events import CANDIDATE_EVENT_TYPES
 from experience_hub.experiences.reconcile_contracts import (
     PayloadReconcileIssue,
     PayloadReconcileReport,
@@ -27,6 +29,19 @@ def _settings(path: Path) -> Settings:
 
 
 @pytest.mark.asyncio
+async def test_container_bootstraps_candidate_replay_and_source_validation(
+    tmp_path: Path,
+) -> None:
+    container = ApplicationContainer.build(_settings(tmp_path / "candidate.sqlite3"))
+    try:
+        assert container.event_registry.event_types >= CANDIDATE_EVENT_TYPES
+        assert container.reducer_versions["candidate_state"] == 1
+        assert "capture_graph" in container.source_validator._hooks  # noqa: SLF001
+    finally:
+        await container.close()
+
+
+@pytest.mark.asyncio
 async def test_runtime_migrates_and_initializes_a_fresh_database(
     tmp_path: Path,
 ) -> None:
@@ -39,7 +54,7 @@ async def test_runtime_migrates_and_initializes_a_fresh_database(
         recover_interrupted=False,
     ) as container:
         retained = container
-        assert container.schema_revision == "0005_inspiration_falsifiers"
+        assert container.schema_revision == "0007_capture_evidence_hashes"
         assert container.lifecycle_worker.running is False
         async with container.database.read_session() as session:
             version = await session.scalar(
@@ -56,6 +71,36 @@ async def test_runtime_migrates_and_initializes_a_fresh_database(
 
     assert retained is not None
     assert retained.closed
+
+
+@pytest.mark.asyncio
+async def test_runtime_migrates_exact_structured_url_with_question_mark_path(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "structured?exact.sqlite3"
+    truncated_path = tmp_path / "structured"
+    settings = Settings(
+        database_url=URL.create(
+            "sqlite+aiosqlite",
+            database=str(database_path),
+        )
+    )
+
+    async with (
+        ApplicationRuntime(settings).initialize(
+            start_lifecycle_worker=False,
+            recover_interrupted=False,
+        ) as container,
+        container.database.read_session() as session,
+    ):
+        revision = await session.scalar(
+            text("SELECT version_num FROM alembic_version")
+        )
+        assert revision == "0007_capture_evidence_hashes"
+        assert revision == container.schema_revision
+
+    assert database_path.is_file()
+    assert not truncated_path.exists()
 
 
 @pytest.mark.asyncio
@@ -124,7 +169,7 @@ async def test_shutdown_stops_worker_then_runs_hooks_before_engine_disposal(
 
         container.register_shutdown_hook(observe_shutdown)
 
-    assert observations == [(False, "0005_inspiration_falsifiers")]
+    assert observations == [(False, "0007_capture_evidence_hashes")]
 
 
 @pytest.mark.asyncio

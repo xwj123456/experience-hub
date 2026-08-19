@@ -41,6 +41,8 @@ jobs:
         run: uv run ruff check .
       - name: Type check
         run: uv run mypy src
+      - name: Verify release evidence
+        run: uv run experience-hub release verify
 
   tests:
     name: tests (${{ matrix.name }})

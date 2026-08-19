@@ -78,8 +78,7 @@ def _alembic_config(url: URL) -> Config:
         "script_location",
         str(root / "src" / "experience_hub" / "storage" / "migrations"),
     )
-    rendered_url = url.render_as_string(hide_password=False).replace("%", "%%")
-    config.set_main_option("sqlalchemy.url", rendered_url)
+    config.attributes["sqlalchemy_url"] = url
     return config
 
 
@@ -132,6 +131,37 @@ async def migrate_to_head(settings: Settings) -> str:
     """Migrate a supported file database without blocking the event loop."""
     try:
         return await asyncio.to_thread(_migrate_to_head_sync, settings)
+    except BaseException as error:
+        if is_sqlite_lock_error(error):
+            raise DatabaseBusy from error
+        raise
+
+
+def _require_current_schema_sync(settings: Settings) -> str:
+    url = _synchronous_sqlite_url(settings)
+    try:
+        script = ScriptDirectory.from_config(_alembic_config(url))
+        head = script.get_current_head()
+        current = _current_revision(url)
+    except CommandError:
+        raise SchemaRevisionError(
+            current_revision=None,
+            expected_revision="single_head",
+        ) from None
+    if head is None:
+        raise RuntimeError("Alembic migration history has no single head")
+    if current != head:
+        raise SchemaRevisionError(
+            current_revision=current,
+            expected_revision=head,
+        )
+    return head
+
+
+async def require_current_schema(settings: Settings) -> str:
+    """Require the installed schema head without running migrations."""
+    try:
+        return await asyncio.to_thread(_require_current_schema_sync, settings)
     except BaseException as error:
         if is_sqlite_lock_error(error):
             raise DatabaseBusy from error
@@ -205,4 +235,5 @@ __all__ = [
     "SchemaRevisionError",
     "SchemaVersionError",
     "migrate_to_head",
+    "require_current_schema",
 ]

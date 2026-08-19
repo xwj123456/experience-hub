@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-import hashlib
+import fcntl
 import json
+import os
 import re
-import shutil
-import sqlite3
+import stat
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from contextlib import closing
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import ROUND_HALF_EVEN, Decimal
@@ -52,6 +52,17 @@ from experience_hub.experiences.events import ExperienceReactivatedV1
 from experience_hub.experiences.models import Temperature, VersionContent
 from experience_hub.experiences.queries import ExperienceQuery
 from experience_hub.experiences.service import ExperienceRetrievalAdapter
+from experience_hub.experiments.errors import ExperimentIsolationError
+from experience_hub.experiments.snapshots import (
+    FrozenSqliteSnapshot,
+    checkpoint_owned_sqlite,
+    clone_frozen_sqlite,
+    freeze_closed_sqlite,
+)
+from experience_hub.experiments.workspace import (
+    WorkspacePolicy,
+    prepare_owned_workspace,
+)
 from experience_hub.ids import SequenceIdGenerator
 from experience_hub.inspiration.commands import StartInspirationRun
 from experience_hub.inspiration.hashing import (
@@ -135,15 +146,18 @@ _FORBIDDEN_OUTPUT_FIELDS = frozenset(
         "wall_duration",
     }
 )
-_WORKSPACE_ENTRIES = frozenset(
-    {
-        ".experience-hub-benchmark-workspace",
-        "replay-a",
-        "replay-b",
-        "snapshot",
-    }
-)
 _WORKSPACE_MARKER = "experience-hub deterministic benchmark workspace\n"
+_BENCHMARK_WORKSPACE_POLICY = WorkspacePolicy(
+    marker_name=".experience-hub-benchmark-workspace",
+    marker_body=_WORKSPACE_MARKER.encode("utf-8"),
+    owned_entries=frozenset({"replay-a", "replay-b", "snapshot"}),
+)
+_DIRECTORY_FLAGS = (
+    os.O_RDONLY
+    | getattr(os, "O_CLOEXEC", 0)
+    | getattr(os, "O_DIRECTORY", 0)
+    | getattr(os, "O_NOFOLLOW", 0)
+)
 
 
 class BenchmarkIsolationError(RuntimeError):
@@ -180,11 +194,21 @@ class ClosedBenchmarkSnapshot:
 
     seed: BenchmarkSeed
     cases: tuple[BenchmarkCase, ...]
-    database_path: Path
-    database_bytes: bytes
-    database_sha256: str
+    frozen_database: FrozenSqliteSnapshot
     index: SeedIndex
     checkpoint_result: tuple[int, int, int]
+
+    @property
+    def database_path(self) -> Path:
+        return self.frozen_database.source_path
+
+    @property
+    def database_bytes(self) -> bytes:
+        return self.frozen_database.database_bytes
+
+    @property
+    def database_sha256(self) -> str:
+        return self.frozen_database.database_sha256
 
 
 @dataclass(frozen=True, slots=True)
@@ -630,31 +654,6 @@ async def _run_lifecycle(
     )
 
 
-def _checkpoint_truncate(path: Path) -> tuple[int, int, int]:
-    with closing(sqlite3.connect(path, isolation_level=None, timeout=5)) as connection:
-        row = connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
-    if (
-        row is None
-        or len(row) != 3
-        or any(isinstance(value, bool) or not isinstance(value, int) for value in row)
-    ):
-        raise BenchmarkIsolationError("SQLite returned an invalid WAL checkpoint")
-    result = cast(tuple[int, int, int], tuple(row))
-    if result != (0, 0, 0):
-        raise BenchmarkIsolationError(
-            f"SQLite WAL checkpoint did not fully truncate: {result}"
-        )
-    for suffix in ("-wal", "-shm", "-journal"):
-        sidecar = Path(f"{path}{suffix}")
-        if sidecar.exists():
-            if sidecar.stat().st_size:
-                raise BenchmarkIsolationError(
-                    f"SQLite {suffix} sidecar remains nonempty after checkpoint"
-                )
-            sidecar.unlink()
-    return result
-
-
 async def prepare_benchmark_snapshot(
     *,
     seed_path: Path,
@@ -733,15 +732,17 @@ async def prepare_benchmark_snapshot(
                 "Seed projections do not match authoritative replay"
             )
 
-    checkpoint_result = _checkpoint_truncate(database_path)
-    database_bytes = database_path.read_bytes()
-    digest = hashlib.sha256(database_bytes).hexdigest()
+    try:
+        checkpoint_result = checkpoint_owned_sqlite(database_path)
+        frozen_database = freeze_closed_sqlite(database_path)
+    except ExperimentIsolationError:
+        raise BenchmarkIsolationError(
+            "SQLite WAL checkpoint did not produce a closed benchmark snapshot"
+        ) from None
     return ClosedBenchmarkSnapshot(
         seed=seed,
         cases=cases,
-        database_path=database_path,
-        database_bytes=database_bytes,
-        database_sha256=digest,
+        frozen_database=frozen_database,
         index=SeedIndex(
             agent_ids=MappingProxyType(dict(agent_ids)),
             experience_ids=MappingProxyType(dict(experience_ids)),
@@ -765,26 +766,27 @@ def clone_closed_database(
     """Clone only exact immutable main-database bytes into a fresh path."""
     if not isinstance(snapshot, ClosedBenchmarkSnapshot):
         raise TypeError("snapshot must be ClosedBenchmarkSnapshot")
-    source_bytes = snapshot.database_path.read_bytes()
-    if (
-        source_bytes != snapshot.database_bytes
-        or hashlib.sha256(source_bytes).hexdigest() != snapshot.database_sha256
-    ):
-        raise BenchmarkIsolationError("Benchmark snapshot is no longer immutable")
-    for suffix in ("-wal", "-shm", "-journal"):
-        source_sidecar = Path(f"{snapshot.database_path}{suffix}")
-        if source_sidecar.exists() and source_sidecar.stat().st_size:
-            label = "WAL" if suffix == "-wal" else suffix
+    try:
+        return clone_frozen_sqlite(snapshot.frozen_database, destination)
+    except ExperimentIsolationError as error:
+        if error.code in {"replay_snapshot_invalid", "replay_snapshot_changed"}:
+            for suffix in ("-wal", "-shm", "-journal"):
+                sidecar = Path(f"{snapshot.database_path}{suffix}")
+                try:
+                    nonempty = sidecar.exists() and sidecar.stat().st_size
+                except OSError:
+                    nonempty = False
+                if nonempty:
+                    label = "WAL" if suffix == "-wal" else suffix
+                    raise BenchmarkIsolationError(
+                        f"Benchmark snapshot has a nonempty {label} sidecar"
+                    ) from None
             raise BenchmarkIsolationError(
-                f"Benchmark snapshot has a nonempty {label} sidecar"
-            )
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    for suffix in ("", "-wal", "-shm", "-journal"):
-        Path(f"{destination}{suffix}").unlink(missing_ok=True)
-    destination.write_bytes(snapshot.database_bytes)
-    if destination.read_bytes() != snapshot.database_bytes:
-        raise BenchmarkIsolationError("Benchmark clone bytes changed during copy")
-    return destination
+                "Benchmark snapshot is no longer immutable"
+            ) from None
+        raise BenchmarkIsolationError(
+            "Benchmark clone bytes changed during copy"
+        ) from None
 
 
 class _HotWarmOnlyQuery:
@@ -2159,47 +2161,250 @@ def _report_document(
     }
 
 
-def _reset_owned_workspace(path: Path, *, allow_unmarked: bool) -> None:
-    if path.is_symlink():
-        raise BenchmarkIsolationError("Benchmark workspace cannot be a symlink")
-    if path.exists() and not path.is_dir():
-        raise BenchmarkIsolationError("Benchmark workspace must be a directory")
-    if path.exists():
-        entries = tuple(path.iterdir())
-        unexpected = sorted(
-            entry.name for entry in entries if entry.name not in _WORKSPACE_ENTRIES
-        )
-        if unexpected:
-            raise BenchmarkIsolationError(
-                "Benchmark workspace contains files not owned by the benchmark"
-            )
-        marker = path / ".experience-hub-benchmark-workspace"
-        if entries and not marker.exists() and not allow_unmarked:
-            raise BenchmarkIsolationError(
-                "Existing custom benchmark workspace has no ownership marker"
-            )
-        if marker.exists():
-            try:
-                marker_body = marker.read_text(encoding="utf-8")
-            except OSError as error:
-                raise BenchmarkIsolationError(
-                    "Benchmark workspace ownership marker is unreadable"
-                ) from error
-            if marker_body != _WORKSPACE_MARKER:
-                raise BenchmarkIsolationError(
-                    "Benchmark workspace ownership marker is invalid"
-                )
-        for name in sorted(_WORKSPACE_ENTRIES):
-            entry = path / name
-            if entry.is_symlink() or entry.is_file():
-                entry.unlink(missing_ok=True)
-            elif entry.is_dir():
-                shutil.rmtree(entry)
-    path.mkdir(parents=True, exist_ok=True)
-    (path / ".experience-hub-benchmark-workspace").write_text(
-        _WORKSPACE_MARKER,
-        encoding="utf-8",
+def _workspace_not_owned() -> BenchmarkIsolationError:
+    return BenchmarkIsolationError(
+        "Benchmark workspace is not owned by the benchmark"
     )
+
+
+def _open_or_create_directory_path(path: Path) -> int:
+    absolute = path.absolute()
+    descriptor = os.open(absolute.anchor, _DIRECTORY_FLAGS)
+    try:
+        for part in absolute.parts[1:]:
+            try:
+                child = os.open(part, _DIRECTORY_FLAGS, dir_fd=descriptor)
+            except FileNotFoundError:
+                with suppress(FileExistsError):
+                    os.mkdir(part, mode=0o700, dir_fd=descriptor)
+                child = os.open(part, _DIRECTORY_FLAGS, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child
+        return descriptor
+    except OSError:
+        os.close(descriptor)
+        raise _workspace_not_owned() from None
+
+
+def _same_identity(left: os.stat_result, right: os.stat_result) -> bool:
+    return left.st_dev == right.st_dev and left.st_ino == right.st_ino
+
+
+def _entry_status(name: str, parent_fd: int) -> os.stat_result:
+    try:
+        return os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except OSError:
+        raise _workspace_not_owned() from None
+
+
+def _validate_legacy_owned_tree(name: str, parent_fd: int) -> os.stat_result:
+    retained = _entry_status(name, parent_fd)
+    if stat.S_ISLNK(retained.st_mode):
+        raise _workspace_not_owned()
+    if stat.S_ISREG(retained.st_mode):
+        return retained
+    if not stat.S_ISDIR(retained.st_mode):
+        raise _workspace_not_owned()
+
+    child_fd = -1
+    try:
+        child_fd = os.open(name, _DIRECTORY_FLAGS, dir_fd=parent_fd)
+        if not _same_identity(retained, os.fstat(child_fd)):
+            raise _workspace_not_owned()
+        for child_name in sorted(os.listdir(child_fd)):
+            _validate_legacy_owned_tree(child_name, child_fd)
+        if (
+            not _same_identity(retained, os.fstat(child_fd))
+            or not _same_identity(retained, _entry_status(name, parent_fd))
+        ):
+            raise _workspace_not_owned()
+        return retained
+    except BenchmarkIsolationError:
+        raise
+    except OSError:
+        raise _workspace_not_owned() from None
+    finally:
+        if child_fd >= 0:
+            os.close(child_fd)
+
+
+def _require_legacy_entries_unchanged(
+    workspace_fd: int,
+    retained: Mapping[str, os.stat_result],
+    *,
+    marker_present: bool = False,
+) -> None:
+    try:
+        names = tuple(sorted(os.listdir(workspace_fd)))
+    except OSError:
+        raise _workspace_not_owned() from None
+    expected_names = set(retained)
+    if marker_present:
+        expected_names.add(_BENCHMARK_WORKSPACE_POLICY.marker_name)
+    if names != tuple(sorted(expected_names)):
+        raise _workspace_not_owned()
+    for name, expected in retained.items():
+        current = _entry_status(name, workspace_fd)
+        if (
+            current.st_mode != expected.st_mode
+            or not _same_identity(current, expected)
+        ):
+            raise _workspace_not_owned()
+
+
+def _write_legacy_marker(marker_fd: int) -> None:
+    body = _BENCHMARK_WORKSPACE_POLICY.marker_body
+    offset = 0
+    try:
+        while offset < len(body):
+            written = os.write(marker_fd, body[offset:])
+            if written <= 0:
+                raise _workspace_not_owned()
+            offset += written
+        os.fsync(marker_fd)
+        os.lseek(marker_fd, 0, os.SEEK_SET)
+        if os.read(marker_fd, len(body) + 1) != body:
+            raise _workspace_not_owned()
+    except BenchmarkIsolationError:
+        raise
+    except OSError:
+        raise _workspace_not_owned() from None
+
+
+def _remove_owned_marker(
+    workspace_fd: int,
+    expected: os.stat_result | None,
+) -> None:
+    if expected is None:
+        return
+    with suppress(OSError):
+        current = os.stat(
+            _BENCHMARK_WORKSPACE_POLICY.marker_name,
+            dir_fd=workspace_fd,
+            follow_symlinks=False,
+        )
+        if stat.S_ISREG(current.st_mode) and _same_identity(current, expected):
+            os.unlink(
+                _BENCHMARK_WORKSPACE_POLICY.marker_name,
+                dir_fd=workspace_fd,
+            )
+
+
+def _adopt_legacy_benchmark_workspace(
+    path: Path,
+    *,
+    allow_unmarked: bool,
+) -> None:
+    if not allow_unmarked:
+        return
+
+    target = path.absolute()
+    parent_fd = -1
+    workspace_fd = -1
+    marker_fd = -1
+    marker_status: os.stat_result | None = None
+    locked = False
+    try:
+        parent_fd = _open_or_create_directory_path(target.parent)
+        try:
+            workspace_fd = os.open(
+                target.name,
+                _DIRECTORY_FLAGS,
+                dir_fd=parent_fd,
+            )
+        except FileNotFoundError:
+            return
+        fcntl.flock(workspace_fd, fcntl.LOCK_EX)
+        locked = True
+        workspace_status = os.fstat(workspace_fd)
+        if not _same_identity(
+            workspace_status,
+            _entry_status(target.name, parent_fd),
+        ):
+            raise _workspace_not_owned()
+        names = tuple(sorted(os.listdir(workspace_fd)))
+        marker_name = _BENCHMARK_WORKSPACE_POLICY.marker_name
+        if marker_name in names or not names:
+            return
+        if any(
+            name not in _BENCHMARK_WORKSPACE_POLICY.owned_entries
+            for name in names
+        ):
+            return
+        retained = {
+            name: _validate_legacy_owned_tree(name, workspace_fd)
+            for name in names
+        }
+        _require_legacy_entries_unchanged(workspace_fd, retained)
+        if not _same_identity(
+            workspace_status,
+            _entry_status(target.name, parent_fd),
+        ):
+            raise _workspace_not_owned()
+        marker_fd = os.open(
+            marker_name,
+            os.O_RDWR
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+            dir_fd=workspace_fd,
+        )
+        marker_status = os.fstat(marker_fd)
+        _write_legacy_marker(marker_fd)
+        if (
+            not _same_identity(
+                marker_status,
+                _entry_status(marker_name, workspace_fd),
+            )
+            or not _same_identity(
+                workspace_status,
+                _entry_status(target.name, parent_fd),
+            )
+        ):
+            raise _workspace_not_owned()
+        _require_legacy_entries_unchanged(
+            workspace_fd,
+            retained,
+            marker_present=True,
+        )
+    except BenchmarkIsolationError:
+        _remove_owned_marker(workspace_fd, marker_status)
+        raise
+    except OSError:
+        _remove_owned_marker(workspace_fd, marker_status)
+        raise _workspace_not_owned() from None
+    finally:
+        if marker_fd >= 0:
+            os.close(marker_fd)
+        if locked:
+            with suppress(OSError):
+                fcntl.flock(workspace_fd, fcntl.LOCK_UN)
+        if workspace_fd >= 0:
+            os.close(workspace_fd)
+        if parent_fd >= 0:
+            os.close(parent_fd)
+
+
+def _reset_owned_workspace(path: Path, *, allow_unmarked: bool) -> None:
+    try:
+        parent_fd = _open_or_create_directory_path(path.parent)
+        os.close(parent_fd)
+        _adopt_legacy_benchmark_workspace(
+            path,
+            allow_unmarked=allow_unmarked,
+        )
+        prepare_owned_workspace(
+            path,
+            policy=_BENCHMARK_WORKSPACE_POLICY,
+            replace_owned=True,
+            allow_unmarked_empty=True,
+        )
+    except BenchmarkIsolationError:
+        raise
+    except ExperimentIsolationError:
+        raise _workspace_not_owned() from None
 
 
 async def run_benchmark(

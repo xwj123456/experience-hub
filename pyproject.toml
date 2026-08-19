@@ -1,26 +1,7 @@
 [project]
 name = "experience-hub"
 version = "0.1.0"
-description = "Local-first, deterministic infrastructure for auditable agent memory and evidence-grounded inspiration"
-license = "Apache-2.0"
-authors = [
-    { name = "恒椿" },
-]
-readme = "README.md"
-keywords = [
-    "agent-memory",
-    "ai-agents",
-    "event-sourcing",
-    "knowledge-management",
-    "local-first",
-]
-classifiers = [
-    "Development Status :: 3 - Alpha",
-    "License :: OSI Approved :: Apache Software License",
-    "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.12",
-    "Typing :: Typed",
-]
+description = "A local-first, deterministic experience hub"
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "aiosqlite>=0.20,<1",
@@ -41,6 +22,29 @@ experience-hub = "experience_hub.cli.app:app"
 requires = ["hatchling>=1.25"]
 build-backend = "hatchling.build"
 
+[tool.hatch.build]
+exclude = [
+    "/.cache",
+    "/.coverage*",
+    "/.data",
+    "/.env",
+    "/.env.*",
+    "/.local",
+    "/.secrets",
+    "/.internal",
+    "/.worktrees",
+    "/AGENTS.md",
+    "/build",
+    "/coverage.xml",
+    "/dist",
+    "/docs/internal",
+    "/htmlcov",
+    "/provider-secrets*",
+    "*.db",
+    "*.sqlite",
+    "*.sqlite3",
+]
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/experience_hub"]
 
@@ -58,6 +62,11 @@ dev = [
 asyncio_mode = "auto"
 testpaths = ["tests"]
 addopts = "-ra"
+# Five corruption-fixture warnings reach Python 3.12's deprecated sqlite adapter
+# through aiosqlite. Suppress only that exact upstream warning and module.
+filterwarnings = [
+    'ignore:The default datetime adapter is deprecated as of Python 3[.]12; see the sqlite3 documentation for suggested replacement recipes:DeprecationWarning:aiosqlite[.]core',
+]
 
 [tool.coverage.run]
 branch = true

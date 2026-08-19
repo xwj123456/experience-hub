@@ -19,6 +19,15 @@ from experience_hub.benchmark.runner import (
     prepare_benchmark_snapshot,
     run_benchmark,
 )
+from experience_hub.experiments.snapshots import (
+    FrozenSqliteSnapshot,
+    checkpoint_owned_sqlite,
+    clone_frozen_sqlite,
+)
+from experience_hub.experiments.workspace import (
+    WorkspacePolicy,
+    prepare_owned_workspace,
+)
 
 REPOSITORY_ROOT = Path(__file__).parents[2]
 SEED_PATH = REPOSITORY_ROOT / "benchmarks" / "seed.json"
@@ -36,6 +45,12 @@ async def test_seed_snapshot_is_closed_checkpointed_and_cloned_by_exact_bytes(
     )
 
     source_bytes = snapshot.database_path.read_bytes()
+    assert benchmark_runner._WORKSPACE_MARKER == (
+        "experience-hub deterministic benchmark workspace\n"
+    )
+    assert isinstance(snapshot.frozen_database, FrozenSqliteSnapshot)
+    assert snapshot.checkpoint_result == (0, 0, 0)
+    assert snapshot.database_bytes == source_bytes
     assert hashlib.sha256(source_bytes).hexdigest() == snapshot.database_sha256
     assert snapshot.database_path.is_file()
     assert not Path(f"{snapshot.database_path}-wal").exists()
@@ -58,6 +73,233 @@ async def test_seed_snapshot_is_closed_checkpointed_and_cloned_by_exact_bytes(
         ).fetchone()
     assert clone_only is None
     assert snapshot.database_path.read_bytes() == source_bytes
+
+
+@pytest.mark.asyncio
+async def test_snapshot_preparation_delegates_owned_checkpoint(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    checkpointed: list[Path] = []
+
+    def recording_checkpoint(path: Path) -> tuple[int, int, int]:
+        checkpointed.append(path)
+        return checkpoint_owned_sqlite(path)
+
+    monkeypatch.setattr(
+        benchmark_runner,
+        "checkpoint_owned_sqlite",
+        recording_checkpoint,
+        raising=False,
+    )
+
+    snapshot = await prepare_benchmark_snapshot(
+        seed_path=SEED_PATH,
+        cases_path=CASES_PATH,
+        workspace=tmp_path / "benchmark",
+    )
+
+    assert checkpointed == [snapshot.database_path]
+    assert snapshot.checkpoint_result == (0, 0, 0)
+
+
+@pytest.mark.asyncio
+async def test_clone_delegates_frozen_sqlite_copy(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    snapshot = await prepare_benchmark_snapshot(
+        seed_path=SEED_PATH,
+        cases_path=CASES_PATH,
+        workspace=tmp_path / "benchmark",
+    )
+    cloned: list[tuple[FrozenSqliteSnapshot, Path]] = []
+
+    def recording_clone(
+        frozen: FrozenSqliteSnapshot,
+        destination: Path,
+    ) -> Path:
+        cloned.append((frozen, destination))
+        return clone_frozen_sqlite(frozen, destination)
+
+    monkeypatch.setattr(
+        benchmark_runner,
+        "clone_frozen_sqlite",
+        recording_clone,
+        raising=False,
+    )
+    destination = tmp_path / "clone" / "case.sqlite3"
+
+    result = clone_closed_database(snapshot, destination)
+
+    assert cloned == [(snapshot.frozen_database, destination)]
+    assert result == destination
+    assert result.read_bytes() == snapshot.database_bytes
+
+
+def test_workspace_reset_delegates_legacy_owned_policy(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    prepared: list[tuple[Path, WorkspacePolicy, bool, bool]] = []
+
+    def recording_prepare(
+        path: Path,
+        *,
+        policy: WorkspacePolicy,
+        replace_owned: bool,
+        allow_unmarked_empty: bool,
+    ) -> object:
+        prepared.append(
+            (path, policy, replace_owned, allow_unmarked_empty)
+        )
+        return prepare_owned_workspace(
+            path,
+            policy=policy,
+            replace_owned=replace_owned,
+            allow_unmarked_empty=allow_unmarked_empty,
+        )
+
+    monkeypatch.setattr(
+        benchmark_runner,
+        "prepare_owned_workspace",
+        recording_prepare,
+        raising=False,
+    )
+    default_workspace = tmp_path / "default"
+    custom_workspace = tmp_path / "custom"
+
+    benchmark_runner._reset_owned_workspace(
+        default_workspace,
+        allow_unmarked=True,
+    )
+    benchmark_runner._reset_owned_workspace(
+        custom_workspace,
+        allow_unmarked=False,
+    )
+
+    expected_policy = WorkspacePolicy(
+        marker_name=".experience-hub-benchmark-workspace",
+        marker_body=b"experience-hub deterministic benchmark workspace\n",
+        owned_entries=frozenset({"replay-a", "replay-b", "snapshot"}),
+    )
+    assert prepared == [
+        (default_workspace, expected_policy, True, True),
+        (custom_workspace, expected_policy, True, True),
+    ]
+    assert (
+        default_workspace / ".experience-hub-benchmark-workspace"
+    ).read_bytes() == expected_policy.marker_body
+    assert (
+        custom_workspace / ".experience-hub-benchmark-workspace"
+    ).read_bytes() == expected_policy.marker_body
+
+
+def test_existing_empty_custom_workspace_is_adopted_without_allow_unmarked(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "custom"
+    workspace.mkdir()
+
+    benchmark_runner._reset_owned_workspace(
+        workspace,
+        allow_unmarked=False,
+    )
+
+    assert tuple(entry.name for entry in workspace.iterdir()) == (
+        ".experience-hub-benchmark-workspace",
+    )
+    assert (
+        workspace / ".experience-hub-benchmark-workspace"
+    ).read_bytes() == b"experience-hub deterministic benchmark workspace\n"
+
+
+def test_default_workspace_safely_adopts_only_legacy_owned_entries(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "default"
+    retained = workspace / "replay-a" / "nested" / "retained-before-reset.txt"
+    retained.parent.mkdir(parents=True)
+    retained.write_bytes(b"old benchmark output")
+    (workspace / "replay-b").mkdir()
+    (workspace / "snapshot").mkdir()
+    prepare_count = 0
+
+    def recording_prepare(
+        path: Path,
+        *,
+        policy: WorkspacePolicy,
+        replace_owned: bool,
+        allow_unmarked_empty: bool,
+    ) -> object:
+        nonlocal prepare_count
+        prepare_count += 1
+        return prepare_owned_workspace(
+            path,
+            policy=policy,
+            replace_owned=replace_owned,
+            allow_unmarked_empty=allow_unmarked_empty,
+        )
+
+    monkeypatch.setattr(
+        benchmark_runner,
+        "prepare_owned_workspace",
+        recording_prepare,
+    )
+
+    benchmark_runner._reset_owned_workspace(
+        workspace,
+        allow_unmarked=True,
+    )
+
+    assert prepare_count == 1
+    assert tuple(entry.name for entry in workspace.iterdir()) == (
+        ".experience-hub-benchmark-workspace",
+    )
+    assert (
+        workspace / ".experience-hub-benchmark-workspace"
+    ).read_bytes() == b"experience-hub deterministic benchmark workspace\n"
+
+
+def test_unmarked_default_workspace_with_unknown_entry_is_preserved(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "default"
+    workspace.mkdir()
+    retained = workspace / "unknown.txt"
+    retained.write_bytes(b"user data")
+
+    with pytest.raises(BenchmarkIsolationError, match="not owned"):
+        benchmark_runner._reset_owned_workspace(
+            workspace,
+            allow_unmarked=True,
+        )
+
+    assert retained.read_bytes() == b"user data"
+    assert not (
+        workspace / ".experience-hub-benchmark-workspace"
+    ).exists()
+
+
+def test_unmarked_custom_workspace_with_owned_entry_is_preserved(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "custom"
+    retained = workspace / "replay-a" / "retained.txt"
+    retained.parent.mkdir(parents=True)
+    retained.write_bytes(b"old benchmark output")
+
+    with pytest.raises(BenchmarkIsolationError, match="not owned"):
+        benchmark_runner._reset_owned_workspace(
+            workspace,
+            allow_unmarked=False,
+        )
+
+    assert retained.read_bytes() == b"old benchmark output"
+    assert not (
+        workspace / ".experience-hub-benchmark-workspace"
+    ).exists()
 
 
 @pytest.mark.asyncio

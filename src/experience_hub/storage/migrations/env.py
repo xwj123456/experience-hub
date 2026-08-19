@@ -3,7 +3,8 @@
 from logging.config import fileConfig
 
 from alembic import context
-from sqlalchemy import engine_from_config, pool
+from sqlalchemy import create_engine, pool
+from sqlalchemy.engine import URL
 
 from experience_hub.storage.tables import Base
 
@@ -18,10 +19,21 @@ if (
 target_metadata = Base.metadata
 
 
+def configured_url() -> str | URL:
+    structured_url = config.attributes.get("sqlalchemy_url")
+    if structured_url is None:
+        fallback_url = config.get_main_option("sqlalchemy.url")
+        if fallback_url is None:
+            raise RuntimeError("Alembic database URL is not configured")
+        return fallback_url
+    if not isinstance(structured_url, URL):
+        raise TypeError("sqlalchemy_url attribute must be a SQLAlchemy URL")
+    return structured_url
+
+
 def run_migrations_offline() -> None:
-    url = config.get_main_option("sqlalchemy.url")
     context.configure(
-        url=url,
+        url=configured_url(),
         target_metadata=target_metadata,
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
@@ -33,9 +45,8 @@ def run_migrations_offline() -> None:
 
 
 def run_migrations_online() -> None:
-    connectable = engine_from_config(
-        config.get_section(config.config_ini_section, {}),
-        prefix="sqlalchemy.",
+    connectable = create_engine(
+        configured_url(),
         poolclass=pool.NullPool,
     )
 
