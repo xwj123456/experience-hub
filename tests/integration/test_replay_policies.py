@@ -43,6 +43,10 @@ from experience_hub.experiments.policies import (
     PolicyExecutionContext,
     build_policy_arm,
 )
+from experience_hub.experiments.policy_clones import (
+    require_safe_policy_clone,
+    require_same_policy_clone,
+)
 from experience_hub.ids import SequenceIdGenerator
 from experience_hub.retrieval.contracts import PeekExperiences, SearchResult
 from experience_hub.retrieval.ranking import RetrievalMode
@@ -263,6 +267,19 @@ def _context(case: ReplayCaseV1, clone_path: Path) -> PolicyExecutionContext:
         frozen_at=FROZEN_AT,
         seed=17,
     )
+
+
+def test_extracted_clone_helper_retains_the_original_regular_clone(
+    tmp_path: Path,
+) -> None:
+    clone_path = tmp_path / "regular-clone.sqlite3"
+    with closing(sqlite3.connect(clone_path)):
+        pass
+
+    identity = require_safe_policy_clone(clone_path)
+    require_same_policy_clone(identity)
+
+    assert identity.path == clone_path.absolute()
 
 
 @pytest.mark.asyncio
