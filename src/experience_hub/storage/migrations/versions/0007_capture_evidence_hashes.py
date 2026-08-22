@@ -284,16 +284,55 @@ def upgrade() -> None:
             ),
             values,
         )
-    with op.batch_alter_table(_TABLE, recreate="always") as batch:
-        batch.alter_column(
-            "source_hash",
-            existing_type=sa.String(length=64),
-            nullable=False,
-        )
-        batch.create_check_constraint(
-            "ck_trajectory_evidence_source_hash",
-            _sha256_check("source_hash"),
-        )
+    op.execute(
+        "CREATE TABLE _trajectory_evidence_v7 ("
+        "evidence_id VARCHAR(36) NOT NULL, "
+        "bundle_id VARCHAR(36) NOT NULL, "
+        "owner_agent_id VARCHAR(36) NOT NULL, "
+        "step_id VARCHAR NOT NULL, "
+        "field VARCHAR(11) NOT NULL, "
+        "ordinal INTEGER NOT NULL, "
+        "excerpt VARCHAR NOT NULL, "
+        "excerpt_hash VARCHAR(64) NOT NULL, "
+        "source_hash VARCHAR(64) NOT NULL, "
+        "PRIMARY KEY (evidence_id), "
+        "CONSTRAINT ck_trajectory_evidence_step_id "
+        "CHECK (length(trim(step_id)) > 0), "
+        "CONSTRAINT ck_trajectory_evidence_field "
+        "CHECK (field IN ('observation', 'action', 'outcome')), "
+        "CONSTRAINT ck_trajectory_evidence_ordinal CHECK (ordinal > 0), "
+        "CONSTRAINT ck_trajectory_evidence_excerpt "
+        "CHECK (length(CAST(excerpt AS BLOB)) <= 512), "
+        "CONSTRAINT ck_trajectory_evidence_excerpt_hash "
+        f"CHECK ({_sha256_check('excerpt_hash')}), "
+        "CONSTRAINT ck_trajectory_evidence_source_hash "
+        f"CHECK ({_sha256_check('source_hash')}), "
+        "FOREIGN KEY(bundle_id, owner_agent_id) REFERENCES "
+        "trajectory_bundles (bundle_id, owner_agent_id), "
+        "FOREIGN KEY(owner_agent_id) REFERENCES agents (agent_id)"
+        ")"
+    )
+    op.execute(
+        "INSERT INTO _trajectory_evidence_v7 "
+        "(evidence_id, bundle_id, owner_agent_id, step_id, field, ordinal, "
+        "excerpt, excerpt_hash, source_hash) "
+        "SELECT evidence_id, bundle_id, owner_agent_id, step_id, field, ordinal, "
+        "excerpt, excerpt_hash, source_hash FROM trajectory_evidence"
+    )
+    op.drop_table(_TABLE)
+    op.rename_table("_trajectory_evidence_v7", _TABLE)
+    op.create_index(
+        "ux_trajectory_evidence_bundle_step_field",
+        _TABLE,
+        ["bundle_id", "step_id", "field"],
+        unique=True,
+    )
+    op.create_index(
+        "ix_trajectory_evidence_bundle_ordinal",
+        _TABLE,
+        ["bundle_id", "ordinal", "field", "evidence_id"],
+        unique=False,
+    )
     _create_immutable_triggers()
 
 

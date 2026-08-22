@@ -511,6 +511,47 @@ def test_atomic_write_rechecks_the_workspace_marker(tmp_path: Path) -> None:
     assert not (workspace.root / "artifacts").exists()
 
 
+def test_reserve_new_file_revalidates_marker_and_rejects_existing_target(
+    tmp_path: Path,
+) -> None:
+    workspace = prepare_owned_workspace(
+        tmp_path / "workspace",
+        policy=REPLAY_WORKSPACE_POLICY,
+        replace_owned=False,
+        allow_unmarked_empty=False,
+    )
+    relative = PurePosixPath("snapshot/source.sqlite3")
+
+    reserved = workspace.reserve_new_file(relative)
+
+    assert reserved == workspace.root / "snapshot" / "source.sqlite3"
+    with pytest.raises(ExperimentIsolationError):
+        workspace.reserve_new_file(relative)
+    (workspace.root / REPLAY_WORKSPACE_POLICY.marker_name).unlink()
+    with pytest.raises(ExperimentIsolationError):
+        workspace.require_owned_file(relative)
+
+
+def test_workspace_policy_requirement_rejects_a_different_marker_policy(
+    tmp_path: Path,
+) -> None:
+    workspace = prepare_owned_workspace(
+        tmp_path / "workspace",
+        policy=REPLAY_WORKSPACE_POLICY,
+        replace_owned=False,
+        allow_unmarked_empty=False,
+    )
+
+    with pytest.raises(ExperimentIsolationError):
+        workspace.require_policy(
+            workspace_module.WorkspacePolicy(
+                marker_name=".other-marker",
+                marker_body=b"other\n",
+                owned_entries=frozenset({"snapshot"}),
+            )
+        )
+
+
 def test_atomic_write_cannot_follow_a_replaced_parent_symlink(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

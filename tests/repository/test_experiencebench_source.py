@@ -5,71 +5,74 @@ import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from experience_hub.canonical import canonical_json_bytes, sha256_hex
+from experience_hub.clock import FrozenClock
+from experience_hub.config import Settings
 from experience_hub.experiences.models import ExperienceKind, Temperature
 from experience_hub.experiments.benchmarks.contracts import (
     BenchmarkArmKind,
-    BenchmarkPackManifestV1,
     BenchmarkSourceAgentV1,
     BenchmarkSourceCandidateV1,
     BenchmarkSourceExperienceV1,
 )
-from experience_hub.experiments.benchmarks.loading import LoadedBenchmarkPack
-from experience_hub.experiments.benchmarks.source import build_benchmark_source
+from experience_hub.experiments.benchmarks.loading import (
+    LoadedBenchmarkPack,
+    load_benchmark_pack,
+)
+from experience_hub.experiments.benchmarks.source import (
+    build_benchmark_source,
+    search_document_bytes,
+)
 from experience_hub.experiments.workspace import (
-    WorkspacePolicy,
+    REPLAY_WORKSPACE_POLICY,
     prepare_owned_workspace,
 )
+from experience_hub.ids import SequenceIdGenerator
+from experience_hub.runtime import ApplicationRuntime, require_current_schema
 
 FROZEN_AT = datetime(2026, 8, 20, tzinfo=UTC)
-_POLICY = WorkspacePolicy(
-    marker_name=".experiencebench-source-workspace",
-    marker_body=b"experiencebench source workspace v1\n",
-    owned_entries=frozenset({"snapshot"}),
-)
 
 
-def _pack() -> LoadedBenchmarkPack:
-    manifest = BenchmarkPackManifestV1.model_validate(
-        {
-            "schema_version": 1,
-            "pack_id": "experiencebench-s-pilot",
-            "maturity": "pilot-30",
-            "cases": {"file": "cases.jsonl", "sha256": "0" * 64},
-            "source": {"file": "source.jsonl", "sha256": "1" * 64},
-            "frozen_at": FROZEN_AT,
-            "seed": 20260820,
-            "arms": tuple(
-                {
-                    "schema_version": 1,
-                    "arm_id": value,
-                    "kind": BenchmarkArmKind(value),
-                    "required": True,
-                }
-                for value in (
-                    "no_memory",
-                    "recent_notes",
-                    "sqlite_bm25",
-                    "experience_hub",
-                )
-            ),
-            "oracle_version": 1,
-            "metric_version": 1,
-            "gate_version": 1,
-            "evidence_schema_version": 1,
-            "summary_schema_version": 1,
-            "profile_schema_version": 1,
-            "deterministic_replay_runs": 2,
-            "composition": {
-                "case_count": 30,
-                "public_authored": 20,
-                "reviewed_abstractions": 10,
-                "cases_per_stratum": 6,
-                "chinese": 10,
-                "english": 10,
-                "mixed": 10,
-            },
-        }
-    )
+def _pack(tmp_path: Path) -> LoadedBenchmarkPack:
+    manifest_document = {
+        "schema_version": 1,
+        "pack_id": "experiencebench-s-pilot",
+        "maturity": "pilot-30",
+        "cases": {"file": "cases.jsonl", "sha256": "0" * 64},
+        "source": {"file": "source.jsonl", "sha256": "1" * 64},
+        "frozen_at": FROZEN_AT,
+        "seed": 20260820,
+        "arms": tuple(
+            {
+                "schema_version": 1,
+                "arm_id": value,
+                "kind": BenchmarkArmKind(value),
+                "required": True,
+            }
+            for value in (
+                "no_memory",
+                "recent_notes",
+                "sqlite_bm25",
+                "experience_hub",
+            )
+        ),
+        "oracle_version": 1,
+        "metric_version": 1,
+        "gate_version": 1,
+        "evidence_schema_version": 1,
+        "summary_schema_version": 1,
+        "profile_schema_version": 1,
+        "deterministic_replay_runs": 2,
+        "composition": {
+            "case_count": 30,
+            "public_authored": 20,
+            "reviewed_abstractions": 10,
+            "cases_per_stratum": 6,
+            "chinese": 10,
+            "english": 10,
+            "mixed": 10,
+        },
+    }
     source = (
         BenchmarkSourceAgentV1(schema_version=1, record_type="agent", label="alpha"),
         BenchmarkSourceAgentV1(schema_version=1, record_type="agent", label="beta"),
@@ -96,8 +99,8 @@ def _pack() -> LoadedBenchmarkPack:
             record_type="experience",
             label="active-note",
             owner_label="alpha",
-            created_at=FROZEN_AT - timedelta(days=1),
-            temperature=Temperature.HOT,
+            created_at=FROZEN_AT - timedelta(days=99),
+            temperature=Temperature.WARM,
             kind=ExperienceKind.PROCEDURAL,
             body="Keep the active workflow bounded.",
             summary="Keep the workflow bounded.",
@@ -106,7 +109,7 @@ def _pack() -> LoadedBenchmarkPack:
             applicability=("active operations",),
             evidence=(),
             falsifiers=("The workflow has no duplicate risk.",),
-            importance_micros=900_000,
+            importance_micros=800_000,
             confidence_micros=900_000,
         ),
         BenchmarkSourceCandidateV1(
@@ -114,7 +117,7 @@ def _pack() -> LoadedBenchmarkPack:
             record_type="candidate",
             label="pending-note",
             owner_label="alpha",
-            created_at=FROZEN_AT - timedelta(hours=1),
+            created_at=FROZEN_AT - timedelta(days=98),
             kind=ExperienceKind.PROCEDURAL,
             body="Keep this pending candidate quarantined.",
             summary="Pending candidate stays quarantined.",
@@ -124,50 +127,187 @@ def _pack() -> LoadedBenchmarkPack:
             falsifiers=("The candidate was adopted.",),
         ),
     )
-    return LoadedBenchmarkPack(
-        manifest=manifest,
-        cases=(),
-        source=source,
-        manifest_body=b"{}",
-        cases_body=b"",
-        source_body=b"",
-        source_labels=frozenset(record.label for record in source),
-        total_input_bytes=2,
-        _parent=Path("."),
+    active = source[3]
+    assert isinstance(active, BenchmarkSourceExperienceV1)
+    candidate = source[4]
+    source = (
+        *source[:4],
+        active.model_copy(
+            update={
+                "label": "forbidden-note",
+                "created_at": FROZEN_AT - timedelta(days=98),
+                "body": "Do not apply the forbidden workflow.",
+                "summary": "Forbidden workflow.",
+                "mechanism": "Forbidden behavior is excluded.",
+                "tags": ("forbidden",),
+            }
+        ),
+        active.model_copy(
+            update={
+                "label": "stale-note",
+                "created_at": FROZEN_AT - timedelta(days=97),
+                "body": "Do not apply the stale workflow.",
+                "summary": "Stale workflow.",
+                "mechanism": "Stale behavior is excluded.",
+                "tags": ("stale",),
+            }
+        ),
+        active.model_copy(
+            update={
+                "label": "misleading-note",
+                "created_at": FROZEN_AT - timedelta(days=96),
+                "body": "Do not apply the misleading workflow.",
+                "summary": "Misleading workflow.",
+                "mechanism": "Misleading behavior is excluded.",
+                "tags": ("misleading",),
+            }
+        ),
+        candidate.model_copy(update={"created_at": FROZEN_AT - timedelta(days=95)}),
     )
+    cases: list[dict[str, object]] = []
+    for ordinal in range(30):
+        source_class = "public_authored" if ordinal < 20 else "reviewed_abstraction"
+        case = {
+            "schema_version": 1,
+            "case_id": f"case-{ordinal + 1}",
+            "source_class": source_class,
+            "review_status": (
+                "authored"
+                if source_class == "public_authored"
+                else "maintainer_reviewed"
+            ),
+            "stratum": (
+                "recurring_workflow",
+                "environment_gotcha",
+                "state_change",
+                "failure_recovery",
+                "irrelevant_distractor",
+            )[ordinal % 5],
+            "language": ("zh", "en", "mixed")[ordinal // 10],
+            "difficulty": "A",
+            "owner_label": "alpha",
+            "query": "bounded workflow",
+            "mode": "focused",
+            "tags": ["workflow"],
+            "mechanism_cues": ["bounded"],
+            "limit": 1,
+            "content_budget_bytes": 1024,
+            "source_labels": [
+                "active-note",
+                "forbidden-note",
+                "stale-note",
+                "misleading-note",
+            ],
+            "required": [{"label": "active-note", "weight_micros": 450_000}],
+            "optional": [],
+            "forbidden": [{"label": "forbidden-note", "weight_micros": 100_000}],
+            "stale": [{"label": "stale-note", "weight_micros": 100_000}],
+            "misleading": [{"label": "misleading-note", "weight_micros": 100_000}],
+            "checkpoints": [
+                {
+                    "predicate": "required_set",
+                    "labels": ["active-note"],
+                    "weight_micros": 150_000,
+                }
+            ],
+            "oracle_version": 1,
+        }
+        cases.append(case)
+    source_body = b"".join(
+        canonical_json_bytes(record.model_dump(mode="json")) + b"\n"
+        for record in source
+    )
+    cases_body = b"".join(canonical_json_bytes(case) + b"\n" for case in cases)
+    manifest_document["cases"] = {
+        "file": "cases.jsonl",
+        "sha256": sha256_hex(cases_body),
+    }
+    manifest_document["source"] = {
+        "file": "source.jsonl",
+        "sha256": sha256_hex(source_body),
+    }
+    root = tmp_path / "pack"
+    root.mkdir()
+    (root / "cases.jsonl").write_bytes(cases_body)
+    (root / "source.jsonl").write_bytes(source_body)
+    manifest_path = root / "manifest.json"
+    manifest_path.write_bytes(canonical_json_bytes(manifest_document))
+    return load_benchmark_pack(manifest_path)
 
 
 def _workspace(path: Path):
     return prepare_owned_workspace(
         path,
-        policy=_POLICY,
+        policy=REPLAY_WORKSPACE_POLICY,
         replace_owned=False,
         allow_unmarked_empty=True,
     )
 
 
+async def _verify_frozen_projection(path: Path) -> None:
+    runtime = ApplicationRuntime(
+        Settings(database_url=f"sqlite+aiosqlite:///{path}"),
+        clock=FrozenClock(FROZEN_AT),
+        ids=SequenceIdGenerator(()),
+        migrator=require_current_schema,
+    )
+    async with runtime.initialize(
+        start_lifecycle_worker=False,
+        recover_interrupted=False,
+    ) as container:
+        assert (await container.projection_manager.verify(container.database)).matches
+
+
 def test_build_source_is_deterministic_and_quarantines_pending_candidates(
     tmp_path: Path,
 ) -> None:
-    pack = _pack()
+    pack = _pack(tmp_path)
     first = asyncio.run(build_benchmark_source(pack, _workspace(tmp_path / "first")))
     second = asyncio.run(build_benchmark_source(pack, _workspace(tmp_path / "second")))
 
     assert first.snapshot.database_sha256 == second.snapshot.database_sha256
     assert first.snapshot.database_bytes == second.snapshot.database_bytes
-    assert set(first.index.experience_ids) == {"active-note", "archived-note"}
+    active = next(
+        record
+        for record in pack.source
+        if isinstance(record, BenchmarkSourceExperienceV1)
+        and record.label == "active-note"
+    )
+    assert search_document_bytes(active) == (
+        b"Keep the workflow bounded.\n"
+        b"A bounded workflow prevents duplicate work.\n"
+        b"workflow\nactive operations"
+    )
+    assert set(first.index.experience_ids) == {
+        "active-note",
+        "archived-note",
+        "forbidden-note",
+        "stale-note",
+        "misleading-note",
+    }
     assert set(first.index.candidate_ids) == {"pending-note"}
+    assert set(first.index.agent_ids) == {"alpha", "beta"}
+    assert first.index.labels_by_experience_id == {
+        identifier: label
+        for label, identifier in first.index.experience_ids.items()
+    }
     assert first.index.content_bytes_by_label == {
         "active-note": 97,
         "archived-note": 86,
+        "forbidden-note": 79,
+        "stale-note": 67,
+        "misleading-note": 82,
     }
     assert not any(
         "-" in label and len(label) == 36
         for label in (*first.index.experience_ids, *first.index.candidate_ids)
     )
-    assert not Path(f"{first.path}-wal").exists()
-    assert not Path(f"{first.path}-shm").exists()
-    assert not Path(f"{first.path}-journal").exists()
+    for built in (first, second):
+        assert not Path(f"{built.path}-wal").exists()
+        assert not Path(f"{built.path}-shm").exists()
+        assert not Path(f"{built.path}-journal").exists()
+        assert not Path(f"{built.path}.canonical").exists()
+        asyncio.run(_verify_frozen_projection(built.path))
 
     with sqlite3.connect(first.path) as connection:
         experience_count = connection.execute(
@@ -176,5 +316,5 @@ def test_build_source_is_deterministic_and_quarantines_pending_candidates(
         candidate_count = connection.execute(
             "SELECT COUNT(*) FROM candidate_state WHERE decision = 'pending'"
         ).fetchone()
-    assert experience_count == (2,)
+    assert experience_count == (5,)
     assert candidate_count == (1,)

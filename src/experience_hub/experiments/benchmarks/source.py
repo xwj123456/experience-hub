@@ -5,13 +5,11 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-import os
-import sqlite3
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta
 from functools import partial
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from types import MappingProxyType
 from typing import Any, cast
 from uuid import UUID
@@ -25,6 +23,7 @@ from experience_hub.capture.scopes import TRAJECTORY_IMPORT_SCOPE
 from experience_hub.clock import FrozenClock
 from experience_hub.config import Settings
 from experience_hub.domain import CommandContext, CommandRequest, TypedEvidence
+from experience_hub.experiences.candidate_models import CandidateDecision
 from experience_hub.experiences.contracts import CreateExperience
 from experience_hub.experiences.models import VersionContent
 from experience_hub.experiments.benchmarks.contracts import (
@@ -38,7 +37,10 @@ from experience_hub.experiments.snapshots import (
     checkpoint_owned_sqlite,
     freeze_closed_sqlite,
 )
-from experience_hub.experiments.workspace import OwnedWorkspace
+from experience_hub.experiments.workspace import (
+    REPLAY_WORKSPACE_POLICY,
+    OwnedWorkspace,
+)
 from experience_hub.ids import SequenceIdGenerator
 from experience_hub.lifecycle.scoring import LifecycleConfig
 from experience_hub.runtime import ApplicationRuntime
@@ -133,70 +135,11 @@ def _settings(path: Path) -> Settings:
     return Settings(database_url=url.render_as_string(hide_password=False))
 
 
-def _canonicalize_table_sql(statement: str) -> str:
-    """Order SQLAlchemy-emitted named constraints before replaying a dump."""
-    prefix, marker, remainder = statement.partition("\n\tCONSTRAINT ")
-    if not marker:
-        return statement
-    constraints, suffix = remainder.rsplit("\n)", 1)
-    named, foreign_marker, foreign = constraints.partition(", \n\tFOREIGN KEY")
-    ordered = sorted(named.split(", \n\tCONSTRAINT "))
-    canonical_foreign = ""
-    if foreign_marker:
-        canonical_foreign = ", \n\tFOREIGN KEY" + ", \n\tFOREIGN KEY".join(
-            sorted(foreign.split(", \n\tFOREIGN KEY"))
-        )
-    return (
-        prefix
-        + "\n\tCONSTRAINT "
-        + ", \n\tCONSTRAINT ".join(ordered)
-        + canonical_foreign
-        + "\n)"
-        + suffix
-    )
-
-
-def _canonicalize_closed_sqlite(path: Path) -> None:
-    """Rebuild the closed source with stable schema-constraint ordering."""
-    temporary = Path(f"{path}.canonical")
-    temporary.unlink(missing_ok=True)
-    source = sqlite3.connect(path)
-    target = sqlite3.connect(temporary)
-    try:
-        target.execute("PRAGMA journal_mode=WAL")
-        statements = tuple(
-            _canonicalize_table_sql(statement) for statement in source.iterdump()
-        )
-        begin = tuple(
-            statement for statement in statements if statement == "BEGIN TRANSACTION;"
-        )
-        commit = tuple(statement for statement in statements if statement == "COMMIT;")
-        remaining = tuple(
-            statement for statement in statements if statement not in {*begin, *commit}
-        )
-
-        def category(statement: str) -> int:
-            if statement.startswith("CREATE TABLE"):
-                return 0
-            if statement.startswith(("INSERT", "DELETE")):
-                return 1
-            if statement.startswith("CREATE INDEX"):
-                return 2
-            if statement.startswith("CREATE TRIGGER"):
-                return 3
-            return 4
-
-        for statement in (
-            *begin,
-            *sorted(remaining, key=lambda value: (category(value), value)),
-            *commit,
-        ):
-            target.execute(_canonicalize_table_sql(statement))
-        target.commit()
-    finally:
-        target.close()
-        source.close()
-    os.replace(temporary, path)
+def _advance_to(clock: FrozenClock, target: datetime) -> None:
+    delta = target - clock.now()
+    if delta <= timedelta(0):
+        raise _invalid()
+    clock.advance(delta)
 
 
 def _response_data(result: CommandResult, expected_status: int) -> dict[str, Any]:
@@ -422,8 +365,24 @@ async def build_benchmark_source(
         workspace, OwnedWorkspace
     ):
         raise _invalid()
-    path = workspace.root / "snapshot" / "source.sqlite3"
-    clock = FrozenClock(pack.manifest.frozen_at - timedelta(days=92))
+    source_relative = PurePosixPath("snapshot/source.sqlite3")
+    try:
+        workspace.require_policy(REPLAY_WORKSPACE_POLICY)
+        path = workspace.reserve_new_file(source_relative)
+    except Exception:
+        raise _invalid() from None
+    content_records = tuple(
+        record for record in pack.source if record.record_type != "agent"
+    )
+    if not content_records:
+        raise _invalid()
+    clock = FrozenClock(
+        min(record.created_at for record in content_records)
+        - timedelta(
+            seconds=1
+            + sum(1 for record in pack.source if record.record_type == "agent")
+        )
+    )
     runtime = ApplicationRuntime(
         _settings(path),
         clock=clock,
@@ -443,6 +402,7 @@ async def build_benchmark_source(
             for ordinal, record in enumerate(pack.source, start=1):
                 if record.record_type != "agent":
                     continue
+                clock.advance(timedelta(seconds=1))
                 agent_ids[record.label] = await _create_agent(
                     container, label=record.label, ordinal=ordinal
                 )
@@ -452,7 +412,7 @@ async def build_benchmark_source(
                 owner_agent_id = agent_ids.get(record.owner_label)
                 if owner_agent_id is None:
                     raise _invalid()
-                clock.advance(record.created_at - clock.now())
+                _advance_to(clock, record.created_at)
                 if isinstance(record, BenchmarkSourceExperienceV1):
                     experience_ids[record.label] = await _create_experience(
                         container,
@@ -461,17 +421,6 @@ async def build_benchmark_source(
                         ordinal=ordinal,
                     )
                     content_bytes[record.label] = len(search_document_bytes(record))
-                    if record.temperature.value == "archived":
-                        clock.advance(
-                            record.created_at + timedelta(days=8) - clock.now()
-                        )
-                        await _run_lifecycle(
-                            container, key=f"source-archive-cold-{ordinal}-first"
-                        )
-                        clock.advance(timedelta(seconds=901))
-                        await _run_lifecycle(
-                            container, key=f"source-archive-cold-{ordinal}-second"
-                        )
                 elif isinstance(record, BenchmarkSourceCandidateV1):
                     candidate_ids[record.label] = await _capture_candidate(
                         container,
@@ -482,10 +431,21 @@ async def build_benchmark_source(
                 else:
                     raise _invalid()
 
-            first_cycle_at = pack.manifest.frozen_at - timedelta(seconds=901)
-            clock.advance(first_cycle_at - clock.now())
+            if any(
+                isinstance(record, BenchmarkSourceExperienceV1)
+                and record.temperature.value == "archived"
+                for record in pack.source
+            ):
+                _advance_to(
+                    clock,
+                    pack.manifest.frozen_at - timedelta(days=91, seconds=901),
+                )
+                await _run_lifecycle(container, key="source-archive-prepare-first")
+                clock.advance(timedelta(seconds=901))
+                await _run_lifecycle(container, key="source-archive-prepare-second")
+            _advance_to(clock, pack.manifest.frozen_at - timedelta(seconds=901))
             await _run_lifecycle(container, key="source-lifecycle-first")
-            clock.advance(pack.manifest.frozen_at - clock.now())
+            _advance_to(clock, pack.manifest.frozen_at)
             await _run_lifecycle(container, key="source-lifecycle-final")
             async with container.database.read_session() as session:
                 for record in pack.source:
@@ -503,19 +463,44 @@ async def build_benchmark_source(
                         or retrieval.state.temperature != record.temperature
                     ):
                         raise _invalid()
+                for record in pack.source:
+                    if not isinstance(record, BenchmarkSourceCandidateV1):
+                        continue
+                    candidate_id = candidate_ids[record.label]
+                    owner_agent_id = agent_ids[record.owner_label]
+                    candidate = await container.candidate_service.get_owned(
+                        session=session,
+                        owner_agent_id=owner_agent_id,
+                        candidate_id=candidate_id,
+                    )
+                    candidate_as_experience = (
+                        await container.experience_query.get_owned_retrieval_record(
+                            session=session,
+                            owner_agent_id=owner_agent_id,
+                            experience_id=candidate_id,
+                        )
+                    )
+                    if (
+                        candidate.candidate_id != candidate_id
+                        or candidate.owner_agent_id != owner_agent_id
+                        or candidate.decision is not CandidateDecision.PENDING
+                        or candidate_as_experience is not None
+                    ):
+                        raise _invalid()
             verification = await container.projection_manager.verify(container.database)
             if not verification.matches:
                 raise _invalid()
     except ExperimentInputError:
         raise
-    except (TypeError, ValueError, RuntimeError):
+    except Exception:
         raise _invalid() from None
 
     try:
-        await asyncio.to_thread(_canonicalize_closed_sqlite, path)
+        workspace.require_owned_file(source_relative)
         await asyncio.to_thread(checkpoint_owned_sqlite, path)
         snapshot = await asyncio.to_thread(freeze_closed_sqlite, path)
-    except RuntimeError:
+        workspace.require_owned_file(source_relative)
+    except Exception:
         raise _invalid() from None
     index = BenchmarkSourceIndex(
         agent_ids=MappingProxyType(dict(agent_ids)),

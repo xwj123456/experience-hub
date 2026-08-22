@@ -53,6 +53,101 @@ class OwnedWorkspace:
     _device: int
     _inode: int
 
+    def require_policy(self, policy: WorkspacePolicy) -> None:
+        """Require the exact policy that established this anchored workspace."""
+        if not isinstance(policy, WorkspacePolicy) or self._policy != policy:
+            raise _path_invalid()
+
+    def reserve_new_file(self, relative: PurePosixPath) -> Path:
+        """Exclusively reserve one new owned file after revalidating the root."""
+        parts = _safe_relative_parts(relative)
+        if parts[0] not in self._policy.owned_entries:
+            raise _path_invalid()
+        parent_fd = -1
+        root_fd = -1
+        opened_directories: list[tuple[int, str, int]] = []
+        locked = False
+        try:
+            root_fd = _open_existing_root(self.root)
+            _lock_workspace(root_fd)
+            locked = True
+            _require_identity(root_fd, self._device, self._inode)
+            _require_safe_relative_path(root_fd, parts)
+            _validate_current_ownership(root_fd, self._policy)
+            parent_fd = root_fd
+            for part in parts[:-1]:
+                child_fd = _open_or_create_directory(part, parent_fd)
+                opened_directories.append((parent_fd, part, child_fd))
+                parent_fd = child_fd
+            _validate_regular_or_missing(parts[-1], parent_fd)
+            descriptor = os.open(
+                parts[-1],
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=parent_fd,
+            )
+            try:
+                status = os.fstat(descriptor)
+            finally:
+                os.close(descriptor)
+            if not stat.S_ISREG(status.st_mode):
+                raise _path_invalid()
+            _require_entry_identity(parts[-1], parent_fd, status)
+            _require_linked_directories(opened_directories)
+            _require_path_identity(self.root, root_fd)
+        except ExperimentIsolationError:
+            raise
+        except OSError:
+            raise _write_failed() from None
+        finally:
+            for _, _, directory_fd in reversed(opened_directories):
+                os.close(directory_fd)
+            if locked:
+                _unlock_workspace(root_fd)
+            if root_fd >= 0:
+                os.close(root_fd)
+        return self.root.joinpath(*parts)
+
+    def require_owned_file(self, relative: PurePosixPath) -> Path:
+        """Revalidate one existing regular file in this anchored workspace."""
+        parts = _safe_relative_parts(relative)
+        if parts[0] not in self._policy.owned_entries:
+            raise _path_invalid()
+        parent_fd = -1
+        root_fd = -1
+        opened_directories: list[tuple[int, str, int]] = []
+        locked = False
+        try:
+            root_fd = _open_existing_root(self.root)
+            _lock_workspace(root_fd)
+            locked = True
+            _require_identity(root_fd, self._device, self._inode)
+            _require_safe_relative_path(root_fd, parts)
+            _validate_current_ownership(root_fd, self._policy)
+            parent_fd = root_fd
+            for part in parts[:-1]:
+                child_fd = os.open(part, _DIRECTORY_FLAGS, dir_fd=parent_fd)
+                opened_directories.append((parent_fd, part, child_fd))
+                parent_fd = child_fd
+            status = _lstat(parts[-1], parent_fd)
+            if not stat.S_ISREG(status.st_mode):
+                raise _path_invalid()
+            _require_entry_identity(parts[-1], parent_fd, status)
+            _require_linked_directories(opened_directories)
+            _require_path_identity(self.root, root_fd)
+        except ExperimentIsolationError:
+            raise
+        except OSError:
+            raise _path_invalid() from None
+        finally:
+            for _, _, directory_fd in reversed(opened_directories):
+                os.close(directory_fd)
+            if locked:
+                _unlock_workspace(root_fd)
+            if root_fd >= 0:
+                os.close(root_fd)
+        return self.root.joinpath(*parts)
+
     def atomic_write(self, relative: PurePosixPath, body: bytes) -> Path:
         """Atomically replace one policy-owned artifact with exact bytes."""
         parts = _safe_relative_parts(relative)
