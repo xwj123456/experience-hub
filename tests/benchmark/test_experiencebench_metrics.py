@@ -2,12 +2,14 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 
+import pytest
 from tests.benchmark.experiencebench_factories import valid_case_document
 
 from experience_hub.canonical import canonical_json_bytes
 from experience_hub.experiments.benchmarks.contracts import (
     BENCHMARK_ARM_ORDER,
     BENCHMARK_STRATUM_ORDER,
+    BenchmarkAggregateV1,
     BenchmarkArmDescriptorV1,
     BenchmarkArmEvidenceV1,
     BenchmarkArmObservationV1,
@@ -162,6 +164,59 @@ def test_aggregate_has_signed_sums_exact_counts_and_five_ordered_strata() -> Non
     assert tuple(item.case_count for item in aggregate.strata) == (6, 6, 6, 6, 6)
 
 
+def test_aggregate_keeps_exact_signed_sum_count_and_mean_for_every_stratum() -> None:
+    aggregate = aggregate_benchmark_cases(
+        _thirty_cases(
+            (
+                10_000,
+                20_000,
+                30_000,
+                40_000,
+                50_000,
+                60_000,
+                -10_000,
+                -20_000,
+                -30_000,
+                -40_000,
+                -50_000,
+                -60_000,
+                1,
+                2,
+                3,
+                4,
+                5,
+                6,
+                -1,
+                -2,
+                -3,
+                -4,
+                -5,
+                -6,
+                100_000,
+                0,
+                0,
+                0,
+                0,
+                1,
+            )
+        )
+    )
+
+    assert aggregate is not None
+    assert tuple(
+        (item.sum_delta_micros, item.case_count, item.mean_delta_micros)
+        for item in aggregate.strata
+    ) == (
+        (210_000, 6, 35_000),
+        (-210_000, 6, -35_000),
+        (21, 6, 3),
+        (-21, 6, -4),
+        (100_001, 6, 16_666),
+    )
+    assert aggregate.overall.sum_delta_micros == 100_001
+    assert aggregate.overall.mean_delta_micros == 3_333
+
+
 def _manifest() -> ResolvedBenchmarkManifestV1:
     return ResolvedBenchmarkManifestV1(
         schema_version=1,
@@ -219,6 +274,42 @@ def _gate_state(payload: BenchmarkPassPayloadV1) -> dict[str, bool]:
     }
 
 
+def _gate_state_for_two_passes(
+    first_pass: BenchmarkPassPayloadV1,
+    second_pass: BenchmarkPassPayloadV1,
+) -> dict[str, bool]:
+    return {
+        item.gate_id: item.passed
+        for item in evaluate_pilot_gates(first_pass, second_pass)
+    }
+
+
+def _constructed_payload(
+    *,
+    cases: tuple[BenchmarkCaseEvidenceV1, ...],
+    aggregate: BenchmarkAggregateV1 | None,
+    comparison_complete: bool = True,
+    safety: BenchmarkSafetyEvidenceV1 | None = None,
+) -> BenchmarkPassPayloadV1:
+    return BenchmarkPassPayloadV1.model_construct(
+        schema_version=1,
+        resolved_manifest=_manifest(),
+        cases=cases,
+        comparison_complete=comparison_complete,
+        safety=safety
+        or BenchmarkSafetyEvidenceV1(
+            schema_version=1,
+            owner_leak_count=0,
+            quarantine_leak_count=0,
+            cross_arm_contamination_count=0,
+            source_mutation_count=0,
+            source_unchanged=True,
+            clone_isolation_verified=True,
+        ),
+        aggregate=aggregate,
+    )
+
+
 def test_overall_one_micro_gate_boundary_uses_exact_integer_comparison() -> None:
     failed = _gate_state(_payload(_thirty_cases((50_000,) * 29 + (49_999,))))
     passed = _gate_state(_payload(_thirty_cases((50_000,) * 30)))
@@ -233,6 +324,163 @@ def test_stratum_one_micro_gate_boundary_uses_exact_integer_comparison() -> None
 
     assert failed["stratum_effectiveness"] is False
     assert passed["stratum_effectiveness"] is True
+
+
+def test_different_complete_passes_fail_only_the_deterministic_replay_gate() -> None:
+    first = _payload(_thirty_cases((50_000,) * 30))
+    changed_manifest = first.resolved_manifest.model_copy(update={"seed": 9})
+    second = first.model_copy(
+        update={"resolved_manifest": changed_manifest}
+    )
+
+    gates = _gate_state_for_two_passes(first, second)
+
+    assert gates["comparison_complete"] is True
+    assert gates["complete_arms"] is True
+    assert gates["safety"] is True
+    assert gates["deterministic_replay"] is False
+
+
+@pytest.mark.parametrize(
+    "safety",
+    (
+        BenchmarkSafetyEvidenceV1(
+            schema_version=1,
+            owner_leak_count=1,
+            quarantine_leak_count=0,
+            cross_arm_contamination_count=0,
+            source_mutation_count=0,
+            source_unchanged=True,
+            clone_isolation_verified=True,
+        ),
+        BenchmarkSafetyEvidenceV1(
+            schema_version=1,
+            owner_leak_count=0,
+            quarantine_leak_count=1,
+            cross_arm_contamination_count=0,
+            source_mutation_count=0,
+            source_unchanged=True,
+            clone_isolation_verified=True,
+        ),
+        BenchmarkSafetyEvidenceV1(
+            schema_version=1,
+            owner_leak_count=0,
+            quarantine_leak_count=0,
+            cross_arm_contamination_count=0,
+            source_mutation_count=0,
+            source_unchanged=False,
+            clone_isolation_verified=True,
+        ),
+        BenchmarkSafetyEvidenceV1(
+            schema_version=1,
+            owner_leak_count=0,
+            quarantine_leak_count=0,
+            cross_arm_contamination_count=0,
+            source_mutation_count=0,
+            source_unchanged=True,
+            clone_isolation_verified=False,
+        ),
+    ),
+)
+def test_each_owner_candidate_or_verification_safety_failure_fails_safety_gate(
+    safety: BenchmarkSafetyEvidenceV1,
+) -> None:
+    cases = _thirty_cases((50_000,) * 30)
+    payload = _constructed_payload(
+        cases=cases,
+        aggregate=aggregate_benchmark_cases(cases),
+        safety=safety,
+    )
+
+    gates = _gate_state(payload)
+
+    assert gates["safety"] is False
+
+
+@pytest.mark.parametrize("arm_variant", ("missing", "reordered", "failed"))
+def test_wrong_arm_count_order_or_completeness_fails_complete_arm_gates(
+    arm_variant: str,
+) -> None:
+    cases = _thirty_cases((50_000,) * 30)
+    arms = cases[0].arms
+    if arm_variant == "missing":
+        invalid_arms = arms[:-1]
+    elif arm_variant == "reordered":
+        invalid_arms = (arms[1], arms[0], *arms[2:])
+    else:
+        invalid_arms = (*arms[:-1], _arm("experience_hub", 550_000, complete=False))
+    invalid_case = BenchmarkCaseEvidenceV1.model_construct(
+        **{**cases[0].__dict__, "arms": invalid_arms}
+    )
+    payload = _constructed_payload(
+        cases=(invalid_case, *cases[1:]),
+        aggregate=aggregate_benchmark_cases(cases),
+    )
+
+    gates = _gate_state(payload)
+
+    assert gates["comparison_complete"] is False
+    assert gates["complete_arms"] is False
+    assert "overall_effectiveness" not in gates
+
+
+@pytest.mark.parametrize("variant", ("wrong_count", "duplicate", "unknown", "missing"))
+def test_wrong_or_missing_strata_fail_comparison_completeness(variant: str) -> None:
+    cases = _thirty_cases((50_000,) * 30)
+    if variant == "wrong_count":
+        invalid_cases = cases[:-1]
+    elif variant == "missing":
+        invalid_cases = (*cases[:5], *cases[6:])
+    else:
+        replacement = BenchmarkCaseEvidenceV1.model_construct(
+            **{
+                **cases[6].__dict__,
+                "stratum": (
+                    BenchmarkStratum.RECURRING_WORKFLOW
+                    if variant == "duplicate"
+                    else "unknown"
+                ),
+            }
+        )
+        invalid_cases = (*cases[:6], replacement, *cases[7:])
+    payload = _constructed_payload(
+        cases=invalid_cases,
+        aggregate=aggregate_benchmark_cases(cases),
+    )
+
+    gates = _gate_state(payload)
+
+    assert gates["comparison_complete"] is False
+    assert gates["complete_arms"] is False
+    assert "stratum_effectiveness" not in gates
+
+
+@pytest.mark.parametrize("aggregate_variant", ("missing", "duplicate_scope"))
+def test_missing_or_duplicate_aggregate_strata_fail_comparison_completeness(
+    aggregate_variant: str,
+) -> None:
+    cases = _thirty_cases((50_000,) * 30)
+    aggregate = aggregate_benchmark_cases(cases)
+    assert aggregate is not None
+    if aggregate_variant == "missing":
+        invalid_strata = aggregate.strata[:-1]
+    else:
+        invalid_strata = (
+            aggregate.strata[0],
+            aggregate.strata[0],
+            *aggregate.strata[2:],
+        )
+    invalid_aggregate = aggregate.model_construct(
+        schema_version=1,
+        overall=aggregate.overall,
+        strata=invalid_strata,
+    )
+    payload = _constructed_payload(cases=cases, aggregate=invalid_aggregate)
+
+    gates = _gate_state(payload)
+
+    assert gates["comparison_complete"] is False
+    assert gates["complete_arms"] is False
 
 
 def test_incomplete_payload_has_no_effectiveness_gate() -> None:
