@@ -52,3 +52,7 @@ def test_experiments_exports_only_the_versioned_public_contract() -> None:
         "verify_source_unchanged",
         "write_replay_artifacts",
     }
+
+
+def test_benchmark_contracts_remain_outside_replay_v1_exports() -> None:
+    assert not any(name.startswith("Benchmark") for name in experiments.__all__)
