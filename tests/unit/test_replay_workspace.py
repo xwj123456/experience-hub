@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import fcntl
 import os
 from pathlib import Path, PurePosixPath
@@ -586,6 +587,7 @@ def test_scoped_reservation_detects_replaced_authority_without_removing_new_file
         pytest.raises(ExperimentIsolationError),
         workspace.reserve_new_file_scoped(relative) as reservation,
     ):
+        reservation.path.with_name("source.sqlite3-wal").write_bytes(b"sidecar")
         if replacement == "root":
             workspace.root.rename(tmp_path / "displaced-workspace")
             workspace.root.mkdir()
@@ -601,6 +603,80 @@ def test_scoped_reservation_detects_replaced_authority_without_removing_new_file
         reservation.verify()
 
     assert (workspace.root / relative).read_bytes() == b"replacement"
+    displaced = tmp_path / (
+        "displaced-workspace" if replacement == "root" else "displaced-snapshot"
+    )
+    original_parent = displaced / "snapshot" if replacement == "root" else displaced
+    assert not (original_parent / "source.sqlite3").exists()
+    assert not (original_parent / "source.sqlite3-wal").exists()
+
+
+def test_async_scoped_reservation_does_not_block_holder_progress(
+    tmp_path: Path,
+) -> None:
+    workspace = prepare_owned_workspace(
+        tmp_path / "workspace",
+        policy=REPLAY_WORKSPACE_POLICY,
+        replace_owned=False,
+        allow_unmarked_empty=False,
+    )
+    relative = PurePosixPath("snapshot/source.sqlite3")
+
+    async def scenario() -> None:
+        holder_ready = asyncio.Event()
+        waiter_started = asyncio.Event()
+        holder_progressed = asyncio.Event()
+
+        async def holder() -> None:
+            with await workspace.reserve_new_file_scoped_async(relative):
+                holder_ready.set()
+                await waiter_started.wait()
+                await asyncio.sleep(0)
+                holder_progressed.set()
+
+        async def waiter() -> None:
+            await holder_ready.wait()
+            waiter_started.set()
+            with await workspace.reserve_new_file_scoped_async(relative) as reservation:
+                reservation.commit()
+
+        holder_task = asyncio.create_task(holder())
+        waiter_task = asyncio.create_task(waiter())
+        await asyncio.wait_for(holder_progressed.wait(), timeout=1)
+        await asyncio.wait_for(holder_task, timeout=1)
+        await asyncio.wait_for(waiter_task, timeout=1)
+
+    asyncio.run(scenario())
+    assert (workspace.root / relative).exists()
+
+
+def test_async_reservation_cancellation_waits_for_acquisition_cleanup(
+    tmp_path: Path,
+) -> None:
+    workspace = prepare_owned_workspace(
+        tmp_path / "workspace",
+        policy=REPLAY_WORKSPACE_POLICY,
+        replace_owned=False,
+        allow_unmarked_empty=False,
+    )
+    relative = PurePosixPath("snapshot/source.sqlite3")
+
+    async def scenario() -> None:
+        holder = await workspace.reserve_new_file_scoped_async(relative)
+        waiter = asyncio.create_task(
+            workspace.reserve_new_file_scoped_async(relative)
+        )
+        await asyncio.sleep(0)
+        waiter.cancel()
+        await asyncio.sleep(0)
+        assert not waiter.done()
+        holder.rollback()
+        holder.close()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+
+    asyncio.run(scenario())
+    assert not (workspace.root / "snapshot").exists()
 
 
 def test_workspace_policy_requirement_rejects_a_different_marker_policy(

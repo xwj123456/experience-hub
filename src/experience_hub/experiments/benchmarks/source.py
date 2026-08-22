@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import json
 from collections.abc import Awaitable, Callable, Mapping
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from functools import partial
@@ -357,6 +358,17 @@ async def _run_lifecycle(
     _response_data(await _execute(container, request, handler), 200)
 
 
+async def _complete_threaded[T](operation: Callable[..., T], *arguments: object) -> T:
+    """Keep cancellation from outliving a worker that owns the source path."""
+    worker = asyncio.create_task(asyncio.to_thread(operation, *arguments))
+    try:
+        return await asyncio.shield(worker)
+    except asyncio.CancelledError:
+        with suppress(Exception):
+            await asyncio.shield(worker)
+        raise
+
+
 async def build_benchmark_source(
     pack: LoadedBenchmarkPack,
     workspace: OwnedWorkspace,
@@ -369,7 +381,8 @@ async def build_benchmark_source(
     try:
         workspace.require_policy(REPLAY_WORKSPACE_POLICY)
         source_relative = PurePosixPath("snapshot/source.sqlite3")
-        with workspace.reserve_new_file_scoped(source_relative) as reservation:
+        reservation = await workspace.reserve_new_file_scoped_async(source_relative)
+        with reservation:
             path = reservation.path
             content_records = tuple(
                 record for record in pack.source if record.record_type != "agent"
@@ -498,11 +511,10 @@ async def build_benchmark_source(
                 if not verification.matches:
                     raise _invalid()
             reservation.verify()
-            await asyncio.to_thread(checkpoint_owned_sqlite, path)
-            snapshot = await asyncio.to_thread(freeze_closed_sqlite, path)
+            await _complete_threaded(checkpoint_owned_sqlite, path)
+            snapshot = await _complete_threaded(freeze_closed_sqlite, path)
             reservation.verify()
-            await asyncio.to_thread(verify_source_unchanged, snapshot)
-            reservation.commit()
+            await _complete_threaded(verify_source_unchanged, snapshot)
             source_index = BenchmarkSourceIndex(
                 agent_ids=MappingProxyType(dict(agent_ids)),
                 experience_ids=MappingProxyType(dict(experience_ids)),
@@ -512,12 +524,14 @@ async def build_benchmark_source(
                 ),
                 content_bytes_by_label=MappingProxyType(dict(content_bytes)),
             )
-            return BuiltBenchmarkSource(
+            built = BuiltBenchmarkSource(
                 path=path,
                 snapshot=snapshot,
                 index=source_index,
                 schema_revision=pack.manifest.schema_version,
             )
+            reservation.commit()
+            return built
     except Exception:
         raise _invalid() from None
     raise _invalid()

@@ -3,7 +3,8 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+from threading import Event
 
 import pytest
 
@@ -409,3 +410,44 @@ def test_source_failure_removes_only_its_owned_reservation(
     assert not (workspace.root / "snapshot").exists()
     assert not list(workspace.root.glob("snapshot/*.sqlite3*"))
     assert not list(workspace.root.glob("snapshot/*.tmp"))
+
+
+def test_source_cancellation_waits_for_checkpoint_worker_before_cleanup(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from experience_hub.experiments.benchmarks import source as source_module
+
+    started = Event()
+    release = Event()
+
+    def blocking_checkpoint(*_: object, **__: object) -> tuple[int, int, int]:
+        started.set()
+        assert release.wait(timeout=1)
+        return (0, 0, 0)
+
+    monkeypatch.setattr(source_module, "checkpoint_owned_sqlite", blocking_checkpoint)
+    workspace = _workspace(tmp_path / "workspace")
+
+    async def scenario() -> None:
+        task = asyncio.create_task(build_benchmark_source(_pack(tmp_path), workspace))
+        await asyncio.to_thread(started.wait)
+        contender = asyncio.create_task(
+            workspace.reserve_new_file_scoped_async(
+                PurePosixPath("snapshot/source.sqlite3")
+            )
+        )
+        await asyncio.sleep(0)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+        assert not contender.done()
+        assert (workspace.root / "snapshot" / "source.sqlite3").exists()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        reservation = await contender
+        reservation.rollback()
+        reservation.close()
+
+    asyncio.run(scenario())
+    assert not (workspace.root / "snapshot").exists()

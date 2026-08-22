@@ -9,6 +9,7 @@ workspace contract.
 
 from __future__ import annotations
 
+import asyncio
 import fcntl
 import os
 import stat
@@ -93,7 +94,10 @@ class OwnedFileReservation:
         """Remove only this reservation's retained inode and its empty parents."""
         if self._closed:
             return
-        self.verify()
+        # The retained directory descriptors still address the original tree if
+        # its root or a parent entry was replaced. Do not require the public
+        # path to remain linked before removing our original inode.
+        _require_entry_identity(self._parts[-1], self._parent_fd, self._status)
         for suffix in (
             "-wal",
             "-shm",
@@ -119,9 +123,11 @@ class OwnedFileReservation:
             return
         self._closed = True
         for _, _, directory_fd, _ in reversed(self._directories):
-            os.close(directory_fd)
+            with suppress(OSError):
+                os.close(directory_fd)
         _unlock_workspace(self._root_fd)
-        os.close(self._root_fd)
+        with suppress(OSError):
+            os.close(self._root_fd)
 
 
 @dataclass(frozen=True, slots=True)
@@ -209,6 +215,29 @@ class OwnedWorkspace:
                     os.close(directory_fd)
                 _unlock_workspace(root_fd)
                 os.close(root_fd)
+
+    async def reserve_new_file_scoped_async(
+        self, relative: PurePosixPath
+    ) -> OwnedFileReservation:
+        """Acquire a scoped reservation without blocking an async event loop."""
+        worker = asyncio.create_task(
+            asyncio.to_thread(self.reserve_new_file_scoped, relative)
+        )
+        try:
+            return await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            try:
+                reservation = await asyncio.shield(worker)
+            except Exception:
+                pass
+            else:
+                try:
+                    reservation.rollback()
+                except ExperimentIsolationError:
+                    pass
+                finally:
+                    reservation.close()
+            raise
 
     def reserve_new_file(self, relative: PurePosixPath) -> Path:
         """Exclusively reserve one new owned file after revalidating the root."""
