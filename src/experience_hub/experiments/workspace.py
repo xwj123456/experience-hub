@@ -223,21 +223,29 @@ class OwnedWorkspace:
         worker = asyncio.create_task(
             asyncio.to_thread(self.reserve_new_file_scoped, relative)
         )
-        try:
-            return await asyncio.shield(worker)
-        except asyncio.CancelledError:
+        cancellation: asyncio.CancelledError | None = None
+        while True:
             try:
                 reservation = await asyncio.shield(worker)
+            except asyncio.CancelledError as error:
+                if cancellation is None:
+                    cancellation = error
+                continue
             except Exception:
+                if cancellation is None:
+                    raise
+                break
+            if cancellation is None:
+                return reservation
+            try:
+                reservation.rollback()
+            except ExperimentIsolationError:
                 pass
-            else:
-                try:
-                    reservation.rollback()
-                except ExperimentIsolationError:
-                    pass
-                finally:
-                    reservation.close()
-            raise
+            finally:
+                reservation.close()
+            raise cancellation
+        assert cancellation is not None
+        raise cancellation
 
     def reserve_new_file(self, relative: PurePosixPath) -> Path:
         """Exclusively reserve one new owned file after revalidating the root."""

@@ -412,7 +412,7 @@ def test_source_failure_removes_only_its_owned_reservation(
     assert not list(workspace.root.glob("snapshot/*.tmp"))
 
 
-def test_source_cancellation_waits_for_checkpoint_worker_before_cleanup(
+def test_source_repeated_cancellation_waits_for_checkpoint_worker_before_cleanup(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     from experience_hub.experiments.benchmarks import source as source_module
@@ -423,7 +423,7 @@ def test_source_cancellation_waits_for_checkpoint_worker_before_cleanup(
     def blocking_checkpoint(*_: object, **__: object) -> tuple[int, int, int]:
         started.set()
         assert release.wait(timeout=1)
-        return (0, 0, 0)
+        raise RuntimeError("ordinary worker failure")
 
     monkeypatch.setattr(source_module, "checkpoint_owned_sqlite", blocking_checkpoint)
     workspace = _workspace(tmp_path / "workspace")
@@ -437,17 +437,25 @@ def test_source_cancellation_waits_for_checkpoint_worker_before_cleanup(
             )
         )
         await asyncio.sleep(0)
-        task.cancel()
+        task.cancel("first cancellation")
         await asyncio.sleep(0)
         assert not task.done()
         assert not contender.done()
         assert (workspace.root / "snapshot" / "source.sqlite3").exists()
-        release.set()
-        with pytest.raises(asyncio.CancelledError):
-            await task
-        reservation = await contender
-        reservation.rollback()
-        reservation.close()
+        task.cancel("second cancellation")
+        try:
+            await asyncio.sleep(0)
+            assert not task.done()
+            assert not contender.done()
+            assert (workspace.root / "snapshot" / "source.sqlite3").exists()
+        finally:
+            release.set()
+            with pytest.raises(asyncio.CancelledError) as captured:
+                await task
+            assert captured.value.args == ("first cancellation",)
+            reservation = await contender
+            reservation.rollback()
+            reservation.close()
 
     asyncio.run(scenario())
     assert not (workspace.root / "snapshot").exists()

@@ -6,7 +6,6 @@ import asyncio
 import hashlib
 import json
 from collections.abc import Awaitable, Callable, Mapping
-from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from functools import partial
@@ -361,12 +360,23 @@ async def _run_lifecycle(
 async def _complete_threaded[T](operation: Callable[..., T], *arguments: object) -> T:
     """Keep cancellation from outliving a worker that owns the source path."""
     worker = asyncio.create_task(asyncio.to_thread(operation, *arguments))
-    try:
-        return await asyncio.shield(worker)
-    except asyncio.CancelledError:
-        with suppress(Exception):
-            await asyncio.shield(worker)
-        raise
+    cancellation: asyncio.CancelledError | None = None
+    while True:
+        try:
+            result = await asyncio.shield(worker)
+        except asyncio.CancelledError as error:
+            if cancellation is None:
+                cancellation = error
+            continue
+        except Exception:
+            if cancellation is None:
+                raise
+            break
+        if cancellation is not None:
+            raise cancellation
+        return result
+    assert cancellation is not None
+    raise cancellation
 
 
 async def build_benchmark_source(

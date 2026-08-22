@@ -650,7 +650,7 @@ def test_async_scoped_reservation_does_not_block_holder_progress(
     assert (workspace.root / relative).exists()
 
 
-def test_async_reservation_cancellation_waits_for_acquisition_cleanup(
+def test_async_reservation_repeated_cancellation_waits_for_acquisition_cleanup(
     tmp_path: Path,
 ) -> None:
     workspace = prepare_owned_workspace(
@@ -666,14 +666,20 @@ def test_async_reservation_cancellation_waits_for_acquisition_cleanup(
         waiter = asyncio.create_task(
             workspace.reserve_new_file_scoped_async(relative)
         )
-        await asyncio.sleep(0)
-        waiter.cancel()
-        await asyncio.sleep(0)
-        assert not waiter.done()
-        holder.rollback()
-        holder.close()
-        with pytest.raises(asyncio.CancelledError):
-            await waiter
+        try:
+            await asyncio.sleep(0)
+            waiter.cancel("first cancellation")
+            await asyncio.sleep(0)
+            assert not waiter.done()
+            waiter.cancel("second cancellation")
+            await asyncio.sleep(0)
+            assert not waiter.done()
+        finally:
+            holder.rollback()
+            holder.close()
+            with pytest.raises(asyncio.CancelledError) as captured:
+                await waiter
+            assert captured.value.args == ("first cancellation",)
 
     asyncio.run(scenario())
     assert not (workspace.root / "snapshot").exists()
