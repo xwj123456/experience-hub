@@ -303,6 +303,11 @@ def _valid_pass_payload_document() -> dict[str, object]:
         "cases": [
             {
                 "schema_version": 1,
+                "case": {
+                    **valid_case_document(),
+                    "case_id": f"case-{index}",
+                    "stratum": strata[index // 6],
+                },
                 "case_id": f"case-{index}",
                 "source_class": "public_authored",
                 "stratum": strata[index // 6],
@@ -346,6 +351,20 @@ def test_evidence_requires_pilot_cardinality_and_consistent_state() -> None:
 
     with pytest.raises(ValidationError, match="exactly 30"):
         BenchmarkEvidenceDataV1.model_validate_json(canonical_json_bytes(document))
+
+
+def test_case_evidence_requires_one_identity_bound_canonical_case() -> None:
+    document = _valid_evidence_data_document()
+    cases = document["pass_payload"]["cases"]
+    assert isinstance(cases, list)
+    first = cases[0]
+    assert isinstance(first, dict)
+    first.pop("case")
+
+    with pytest.raises(ValidationError, match="case"):
+        BenchmarkEvidenceDataV1.model_validate_json(
+            canonical_json_bytes(document)
+        )
 
     document = _valid_evidence_data_document()
     document["deterministic_replay_match"] = False

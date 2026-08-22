@@ -508,6 +508,7 @@ class BenchmarkArmEvidenceV1(_BenchmarkModel):
 
 class BenchmarkCaseEvidenceV1(_BenchmarkModel):
     schema_version: Literal[1]
+    case: BenchmarkCaseV1
     case_id: str
     source_class: BenchmarkSourceClass
     stratum: BenchmarkStratum
@@ -539,6 +540,12 @@ class BenchmarkCaseEvidenceV1(_BenchmarkModel):
 
     @model_validator(mode="after")
     def validate_complete_case(self) -> Self:
+        if (
+            self.case.case_id != self.case_id
+            or self.case.source_class is not self.source_class
+            or self.case.stratum is not self.stratum
+        ):
+            raise ValueError("case evidence identity must match its canonical case")
         arm_ids = tuple(arm.arm_id for arm in self.arms)
         expected = tuple(item.value for item in BENCHMARK_ARM_ORDER)
         if arm_ids != expected:

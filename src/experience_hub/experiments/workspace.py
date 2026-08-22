@@ -13,6 +13,7 @@ import asyncio
 import fcntl
 import os
 import stat
+from collections.abc import Mapping
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -402,6 +403,159 @@ class OwnedWorkspace:
             if root_fd >= 0:
                 os.close(root_fd)
         return self.root.joinpath(*parts)
+
+    def atomic_write_group(
+        self, bodies: Mapping[PurePosixPath, bytes | None]
+    ) -> dict[PurePosixPath, Path | None]:
+        """Publish one owned artifact set with rollback under one workspace lock.
+
+        Cooperating readers that use this workspace's locked file checks observe
+        the complete old set or complete new set. Direct, non-cooperating path
+        readers can observe a brief target absence or mixed set during POSIX
+        renames and must fail closed when the summary/evidence binding fails.
+        """
+        if not isinstance(bodies, Mapping) or not bodies:
+            raise _path_invalid()
+        entries: list[tuple[PurePosixPath, tuple[str, ...], bytes | None]] = []
+        for relative, body in bodies.items():
+            parts = _safe_relative_parts(relative)
+            if (
+                parts[0] not in self._policy.owned_entries
+                or not isinstance(body, (bytes, type(None)))
+            ):
+                raise _path_invalid()
+            entries.append((relative, parts, body))
+        if len({parts for _, parts, _ in entries}) != len(entries):
+            raise _path_invalid()
+
+        root_fd = -1
+        parent_fds: dict[tuple[str, ...], int] = {}
+        parent_links: list[tuple[int, str, int]] = []
+        states: list[
+            tuple[
+                PurePosixPath,
+                tuple[str, ...],
+                bytes | None,
+                int,
+                os.stat_result | None,
+            ]
+        ] = []
+        temporary: dict[tuple[str, ...], tuple[str, os.stat_result]] = {}
+        backups: dict[tuple[str, ...], tuple[str, os.stat_result]] = {}
+        installed: set[tuple[str, ...]] = set()
+        locked = False
+        try:
+            root_fd = _open_existing_root(self.root)
+            _lock_workspace(root_fd)
+            locked = True
+            _require_identity(root_fd, self._device, self._inode)
+            _validate_current_ownership(root_fd, self._policy)
+            for relative, parts, body in entries:
+                _require_safe_relative_path(root_fd, parts)
+                parent = root_fd
+                key: tuple[str, ...] = ()
+                for part in parts[:-1]:
+                    key = (*key, part)
+                    if key not in parent_fds:
+                        child = _open_or_create_directory(part, parent)
+                        parent_fds[key] = child
+                        parent_links.append((parent, part, child))
+                    parent = parent_fds[key]
+                try:
+                    previous = os.stat(
+                        parts[-1], dir_fd=parent, follow_symlinks=False
+                    )
+                except FileNotFoundError:
+                    previous = None
+                except OSError:
+                    raise _path_invalid() from None
+                else:
+                    if previous is None:
+                        raise _path_invalid()
+                    if (
+                        stat.S_ISLNK(previous.st_mode)
+                        or not stat.S_ISREG(previous.st_mode)
+                    ):
+                        raise _path_invalid()
+                states.append((relative, parts, body, parent, previous))
+            for _, parts, body, parent, _ in states:
+                if body is None:
+                    continue
+                temporary_name = f".{parts[-1]}{_TEMPORARY_SUFFIX}"
+                descriptor = _create_temporary(temporary_name, parent)
+                try:
+                    _write_and_read_back(descriptor, body)
+                    status = os.fstat(descriptor)
+                finally:
+                    os.close(descriptor)
+                temporary[parts] = (temporary_name, status)
+            _require_linked_directories(parent_links)
+            _require_path_identity(self.root, root_fd)
+            for _, parts, _, parent, previous in states:
+                if previous is None:
+                    continue
+                backup_name = f".{parts[-1]}.experience-hub.backup"
+                try:
+                    os.stat(backup_name, dir_fd=parent, follow_symlinks=False)
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    raise _path_invalid() from None
+                else:
+                    raise _path_invalid()
+                os.replace(
+                    parts[-1], backup_name, src_dir_fd=parent, dst_dir_fd=parent
+                )
+                _require_entry_identity(backup_name, parent, previous)
+                backups[parts] = (backup_name, previous)
+            for _, parts, body, parent, _ in states:
+                if body is None:
+                    continue
+                temporary_name, status = temporary[parts]
+                _commit_temporary(temporary_name, parts[-1], parent, status)
+                installed.add(parts)
+            _require_linked_directories(parent_links)
+            _require_path_identity(self.root, root_fd)
+            for _, parts, _, parent, _ in states:
+                backup = backups.pop(parts, None)
+                if backup is not None:
+                    _unlink_same_entry(backup[0], parent, backup[1])
+            return {
+                relative: self.root.joinpath(*parts) if body is not None else None
+                for relative, parts, body in entries
+            }
+        except (ExperimentIsolationError, OSError):
+            for _, parts, _, parent, previous in reversed(states):
+                if parts in installed:
+                    with suppress(ExperimentIsolationError):
+                        _unlink_same_entry(parts[-1], parent, temporary[parts][1])
+                backup = backups.get(parts)
+                if backup is not None:
+                    with suppress(OSError):
+                        os.replace(
+                            backup[0], parts[-1], src_dir_fd=parent, dst_dir_fd=parent
+                        )
+                elif previous is None:
+                    with suppress(FileNotFoundError):
+                        os.unlink(parts[-1], dir_fd=parent)
+            raise
+        finally:
+            for parts, (name, _) in temporary.items():
+                parent = next(
+                    parent for _, item, _, parent, _ in states if item == parts
+                )
+                _unlink_if_owned_temporary(name, parent)
+            for parts, (name, status) in backups.items():
+                parent = next(
+                    parent for _, item, _, parent, _ in states if item == parts
+                )
+                _rollback_created_entry(name, parent, status)
+            for directory_fd in reversed(tuple(parent_fds.values())):
+                os.close(directory_fd)
+            if locked:
+                _unlock_workspace(root_fd)
+            if root_fd >= 0:
+                os.close(root_fd)
 
 
 def prepare_owned_workspace(

@@ -63,6 +63,7 @@ def derive_case_comparison(
     if any(arm.status != "complete" for arm in arms):
         return BenchmarkCaseEvidenceV1(
             schema_version=1,
+            case=case,
             case_id=case.case_id,
             source_class=case.source_class,
             stratum=case.stratum,
@@ -94,6 +95,7 @@ def derive_case_comparison(
         raise _invalid_metric_input()
     return BenchmarkCaseEvidenceV1(
         schema_version=1,
+        case=case,
         case_id=case.case_id,
         source_class=case.source_class,
         stratum=case.stratum,
