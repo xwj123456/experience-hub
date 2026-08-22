@@ -171,6 +171,34 @@ def test_evidence_round_trips_as_exact_canonical_bytes() -> None:
     assert body.count(b"\n") == 0
 
 
+def test_evidence_keeps_its_v1_canonical_bytes_after_safe_validator_extraction() -> (
+    None
+):
+    assert canonical_evidence_bytes(_valid_report()) == (
+        b'{"data":{"cases":[{"arms":[{"arm_id":"no_memory","error_code":null,'
+        b'"error_stage":null,"observation":{"returned_labels":[],"schema_version":1,'
+        b'"unmapped_count":0},"schema_version":1,"status":"complete","utility_micros":0},'
+        b'{"arm_id":"experience_hub","error_code":null,"error_stage":null,'
+        b'"observation":{"returned_labels":[],"schema_version":1,"unmapped_count":0},'
+        b'"schema_version":1,"status":"complete","utility_micros":750000}],'
+        b'"case_id":"queue-case","delta_utility_micros":750000,"schema_version":1,'
+        b'"status":"complete"}],"clone_isolation_verified":true,'
+        b'"comparison_complete":true,"deterministic_replay_match":true,'
+        b'"resolved_manifest":{"cases_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",'
+        b'"dataset_id":"contract-cases","evidence_schema_version":1,'
+        b'"experiment_id":"contract-smoke","frozen_at":"2026-07-26T00:00:00.000000Z",'
+        b'"manifest_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",'
+        b'"oracle":{"kind":"retrieval_labels","schema_version":1,"version":1},'
+        b'"policy_arms":[{"arm_id":"no_memory","kind":"no_memory","required":true,'
+        b'"schema_version":1},{"arm_id":"experience_hub","kind":"experience_hub",'
+        b'"required":true,"schema_version":1}],"profile_schema_version":1,'
+        b'"schema_version":1,"seed":7,"snapshot_sha256":'
+        b'"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",'
+        b'"source_schema_revision":1},"schema_version":1,"source_unchanged":true,'
+        b'"valid":true}}'
+    )
+
+
 @pytest.mark.parametrize(
     "forbidden",
     (
@@ -241,8 +269,7 @@ def test_evidence_serializer_failure_is_stable_and_private_detail_free() -> None
 
     assert captured.value.code == "invalid_evidence"
     assert (
-        captured.value.message
-        == "Replay evidence does not match the versioned schema"
+        captured.value.message == "Replay evidence does not match the versioned schema"
     )
     assert PRIVATE_SERIALIZER_DETAIL not in str(captured.value)
     assert captured.value.__cause__ is None
@@ -362,8 +389,8 @@ def test_complete_case_requires_both_ordered_manifest_arms() -> None:
 
 def test_complete_arm_requires_observation_utility_and_no_error() -> None:
     report = _valid_report()
-    failed_arm = report.data.cases[0].arms[1].model_copy(
-        update={"utility_micros": None}
+    failed_arm = (
+        report.data.cases[0].arms[1].model_copy(update={"utility_micros": None})
     )
     case = report.data.cases[0].model_copy(
         update={"arms": (report.data.cases[0].arms[0], failed_arm)}
@@ -375,14 +402,18 @@ def test_complete_arm_requires_observation_utility_and_no_error() -> None:
 
 def test_incomplete_case_requires_null_delta() -> None:
     report = _valid_report()
-    failed_arm = report.data.cases[0].arms[1].model_copy(
-        update={
-            "status": "failed",
-            "observation": None,
-            "utility_micros": None,
-            "error_code": "arm-failed",
-            "error_stage": "execute",
-        }
+    failed_arm = (
+        report.data.cases[0]
+        .arms[1]
+        .model_copy(
+            update={
+                "status": "failed",
+                "observation": None,
+                "utility_micros": None,
+                "error_code": "arm-failed",
+                "error_stage": "execute",
+            }
+        )
     )
     case = report.data.cases[0].model_copy(
         update={
@@ -411,14 +442,18 @@ def test_complete_case_delta_is_recomputed_from_arm_utilities() -> None:
 
 def test_failed_arm_is_valid_only_with_stable_error_fields() -> None:
     report = _valid_report()
-    failed_arm = report.data.cases[0].arms[1].model_copy(
-        update={
-            "status": "failed",
-            "observation": None,
-            "utility_micros": None,
-            "error_code": "arm-failed",
-            "error_stage": "execute",
-        }
+    failed_arm = (
+        report.data.cases[0]
+        .arms[1]
+        .model_copy(
+            update={
+                "status": "failed",
+                "observation": None,
+                "utility_micros": None,
+                "error_code": "arm-failed",
+                "error_stage": "execute",
+            }
+        )
     )
     case = report.data.cases[0].model_copy(
         update={
@@ -438,14 +473,18 @@ def test_failed_arm_is_valid_only_with_stable_error_fields() -> None:
 
 def test_incomplete_case_does_not_skip_validation_of_later_cases() -> None:
     report = _valid_report()
-    failed_arm = report.data.cases[0].arms[1].model_copy(
-        update={
-            "status": "failed",
-            "observation": None,
-            "utility_micros": None,
-            "error_code": "arm-failed",
-            "error_stage": "execute",
-        }
+    failed_arm = (
+        report.data.cases[0]
+        .arms[1]
+        .model_copy(
+            update={
+                "status": "failed",
+                "observation": None,
+                "utility_micros": None,
+                "error_code": "arm-failed",
+                "error_stage": "execute",
+            }
+        )
     )
     incomplete = report.data.cases[0].model_copy(
         update={
@@ -496,8 +535,7 @@ def test_profile_serializer_failure_is_stable_and_private_detail_free() -> None:
 
     assert captured.value.code == "invalid_profile"
     assert (
-        captured.value.message
-        == "Replay profile does not match the versioned schema"
+        captured.value.message == "Replay profile does not match the versioned schema"
     )
     assert PRIVATE_SERIALIZER_DETAIL not in str(captured.value)
     assert captured.value.__cause__ is None

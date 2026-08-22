@@ -95,65 +95,70 @@ def _is_credential_key(key: str) -> bool:
     )
 
 
-def _validate_evidence_value(
-    value: object,
+def validate_safe_evidence_document(
+    document: object,
     *,
-    path: tuple[str | int, ...],
+    allowed_timestamp_paths: frozenset[tuple[str | int, ...]],
 ) -> None:
-    if isinstance(value, Mapping):
-        for key, item in value.items():
-            if not isinstance(key, str):
+    """Reject paths, credentials, UUIDs, unstable timestamps, and values."""
+
+    def validate(value: object, *, path: tuple[str | int, ...]) -> None:
+        if isinstance(value, Mapping):
+            for key, item in value.items():
+                if not isinstance(key, str):
+                    raise _reject(
+                        "unsafe_evidence",
+                        "Replay evidence contains an unsupported object key",
+                    )
+                if key in _FORBIDDEN_EVIDENCE_KEYS or _is_credential_key(key):
+                    raise _reject(
+                        "unsafe_evidence",
+                        "Replay evidence contains a forbidden field",
+                    )
+                validate(item, path=(*path, key))
+            return
+        if isinstance(value, Sequence) and not isinstance(
+            value, (str, bytes, bytearray)
+        ):
+            for index, item in enumerate(value):
+                validate(item, path=(*path, index))
+            return
+        if isinstance(value, BaseException):
+            raise _reject(
+                "unsafe_evidence",
+                "Replay evidence contains an exception value",
+            )
+        if isinstance(value, UUID):
+            raise _reject("unsafe_evidence", "Replay evidence contains a raw UUID")
+        if isinstance(value, datetime):
+            if path not in allowed_timestamp_paths:
                 raise _reject(
                     "unsafe_evidence",
-                    "Replay evidence contains an unsupported object key",
+                    "Replay evidence contains a runtime timestamp",
                 )
-            if key in _FORBIDDEN_EVIDENCE_KEYS or _is_credential_key(key):
+            return
+        if isinstance(value, str):
+            if _UUID_TEXT.search(value):
+                raise _reject("unsafe_evidence", "Replay evidence contains a raw UUID")
+            if _TIMESTAMP_TEXT.search(value) and path not in allowed_timestamp_paths:
                 raise _reject(
                     "unsafe_evidence",
-                    "Replay evidence contains a forbidden field",
+                    "Replay evidence contains a runtime timestamp",
                 )
-            _validate_evidence_value(item, path=(*path, key))
-        return
-    if isinstance(value, Sequence) and not isinstance(
-        value, (str, bytes, bytearray)
-    ):
-        for index, item in enumerate(value):
-            _validate_evidence_value(item, path=(*path, index))
-        return
-    if isinstance(value, BaseException):
+            if _ABSOLUTE_PATH_TEXT.match(value):
+                raise _reject(
+                    "unsafe_evidence",
+                    "Replay evidence contains an absolute path",
+                )
+            return
+        if value is None or isinstance(value, (bool, int)):
+            return
         raise _reject(
             "unsafe_evidence",
-            "Replay evidence contains an exception value",
+            "Replay evidence contains an unsupported value",
         )
-    if isinstance(value, UUID):
-        raise _reject("unsafe_evidence", "Replay evidence contains a raw UUID")
-    if isinstance(value, datetime):
-        if path != _FROZEN_AT_PATH:
-            raise _reject(
-                "unsafe_evidence",
-                "Replay evidence contains a runtime timestamp",
-            )
-        return
-    if isinstance(value, str):
-        if _UUID_TEXT.search(value):
-            raise _reject("unsafe_evidence", "Replay evidence contains a raw UUID")
-        if _TIMESTAMP_TEXT.search(value) and path != _FROZEN_AT_PATH:
-            raise _reject(
-                "unsafe_evidence",
-                "Replay evidence contains a runtime timestamp",
-            )
-        if _ABSOLUTE_PATH_TEXT.match(value):
-            raise _reject(
-                "unsafe_evidence",
-                "Replay evidence contains an absolute path",
-            )
-        return
-    if value is None or isinstance(value, (bool, int)):
-        return
-    raise _reject(
-        "unsafe_evidence",
-        "Replay evidence contains an unsupported value",
-    )
+
+    validate(document, path=())
 
 
 def _validate_arm(arm: ArmEvidenceV1) -> bool:
@@ -204,17 +209,12 @@ def _validate_case(
         )
     if complete:
         no_memory, experience_hub = case.arms
-        if (
-            no_memory.utility_micros is None
-            or experience_hub.utility_micros is None
-        ):
+        if no_memory.utility_micros is None or experience_hub.utility_micros is None:
             raise _reject(
                 "invalid_evidence",
                 "Complete replay arms require utility values",
             )
-        expected_delta = (
-            experience_hub.utility_micros - no_memory.utility_micros
-        )
+        expected_delta = experience_hub.utility_micros - no_memory.utility_micros
         if case.delta_utility_micros != expected_delta:
             raise _reject(
                 "invalid_evidence",
@@ -239,8 +239,7 @@ def _validate_evidence_assertions(report: ReplayEvidenceReportV1) -> None:
             "Replay evidence must contain at least one case",
         )
     case_completeness = tuple(
-        _validate_case(case, expected_arm_ids=expected_arm_ids)
-        for case in data.cases
+        _validate_case(case, expected_arm_ids=expected_arm_ids) for case in data.cases
     )
     cases_complete = all(case_completeness)
     if data.comparison_complete != cases_complete:
@@ -271,11 +270,13 @@ def _validated_evidence(
         )
     try:
         document = report.model_dump(mode="python", warnings=False)
-        _validate_evidence_value(document, path=())
+        validate_safe_evidence_document(
+            document, allowed_timestamp_paths=frozenset({_FROZEN_AT_PATH})
+        )
         validated = ReplayEvidenceReportV1.model_validate(document, strict=True)
-        _validate_evidence_value(
+        validate_safe_evidence_document(
             validated.model_dump(mode="python", warnings=False),
-            path=(),
+            allowed_timestamp_paths=frozenset({_FROZEN_AT_PATH}),
         )
     except ExperimentOutputError:
         raise
@@ -336,7 +337,9 @@ def verify_evidence_bytes(body: bytes) -> ReplayEvidenceReportV1:
                 "noncanonical_json",
                 "Replay evidence must use canonical JSON",
             )
-        _validate_evidence_value(decoded, path=())
+        validate_safe_evidence_document(
+            decoded, allowed_timestamp_paths=frozenset({_FROZEN_AT_PATH})
+        )
         report = ReplayEvidenceReportV1.model_validate_json(body, strict=True)
     except ExperimentOutputError:
         raise
@@ -399,13 +402,10 @@ def write_replay_artifacts(
             "Replay artifacts require an owned workspace",
         )
     evidence_body = canonical_evidence_bytes(evidence)
-    profile_body = (
-        canonical_profile_bytes(profile) if profile is not None else None
-    )
+    profile_body = canonical_profile_bytes(profile) if profile is not None else None
     if (
         profile is not None
-        and profile.data.experiment_id
-        != evidence.data.resolved_manifest.experiment_id
+        and profile.data.experiment_id != evidence.data.resolved_manifest.experiment_id
     ):
         raise _reject(
             "invalid_profile",
@@ -436,6 +436,7 @@ __all__ = [
     "ReplayArtifactSet",
     "canonical_evidence_bytes",
     "canonical_profile_bytes",
+    "validate_safe_evidence_document",
     "verify_evidence_bytes",
     "write_replay_artifacts",
 ]
