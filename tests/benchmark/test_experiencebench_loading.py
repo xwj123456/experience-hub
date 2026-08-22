@@ -14,6 +14,7 @@ from tests.benchmark.experiencebench_factories import (
     valid_source_experience_document,
 )
 
+import experience_hub.experiments.benchmarks.loading as benchmark_loading
 from experience_hub.canonical import canonical_json_bytes, sha256_hex
 from experience_hub.experiments.benchmarks.contracts import (
     BENCHMARK_ARM_ORDER,
@@ -126,11 +127,18 @@ def _manifest_for(path: Path) -> dict[str, object]:
     return json.loads(path.read_bytes())
 
 
-def _assert_rejected(path: Path, code: str) -> None:
+def _assert_rejected(
+    path: Path,
+    code: str,
+    *,
+    rejected_value: str | None = None,
+) -> None:
     with pytest.raises(ExperimentInputError) as raised:
         load_benchmark_pack(path)
     assert raised.value.code == code
     assert str(path) not in str(raised.value)
+    if rejected_value is not None:
+        assert rejected_value not in str(raised.value)
 
 
 def test_loads_hash_closed_canonical_pilot_pack(tmp_path: Path) -> None:
@@ -246,6 +254,29 @@ def test_rejects_composition_that_does_not_match_the_cases(tmp_path: Path) -> No
     _assert_rejected(manifest_path, "benchmark_invalid_pack")
 
 
+def test_rejects_self_consistent_manifest_with_wrong_pilot_split(
+    tmp_path: Path,
+) -> None:
+    cases = [_case(index) for index in range(30)]
+    cases[20]["source_class"] = "public_authored"
+    cases[20]["review_status"] = "authored"
+    cases[0]["language"] = "en"
+    manifest_path = _write_pack(tmp_path, cases=cases)
+    manifest = _manifest_for(manifest_path)
+    manifest["composition"] = {
+        "case_count": 30,
+        "public_authored": 21,
+        "reviewed_abstractions": 9,
+        "cases_per_stratum": 6,
+        "chinese": 9,
+        "english": 11,
+        "mixed": 10,
+    }
+    _rewrite_manifest(manifest_path, manifest)
+
+    _assert_rejected(manifest_path, "benchmark_invalid_pack")
+
+
 def test_rejects_wrong_review_declaration(tmp_path: Path) -> None:
     cases = [_case(index) for index in range(30)]
     cases[20]["review_status"] = "authored"
@@ -263,13 +294,39 @@ def test_rejects_source_content_out_of_timestamp_order(tmp_path: Path) -> None:
     _assert_rejected(manifest_path, "benchmark_invalid_pack")
 
 
-def test_rejects_private_absolute_path_in_public_source_text(tmp_path: Path) -> None:
+def test_rejects_source_content_with_equal_timestamps(tmp_path: Path) -> None:
     cases = [_case(index) for index in range(30)]
     source = _source_for(cases)
-    source[30]["body"] = "Read /Users/private/project/secrets before retrying."
+    source[-1]["created_at"] = source[-2]["created_at"]
     manifest_path = _write_pack(tmp_path, cases=cases, source=source)
 
     _assert_rejected(manifest_path, "benchmark_invalid_pack")
+
+
+@pytest.mark.parametrize(
+    "sentinel",
+    (
+        "/Users/private/project/secrets",
+        r"C:\Users\private\project",
+        "private.operator@example.test",
+        "api_key=not-a-public-value",
+        "-----BEGIN PRIVATE KEY-----",
+        "Bearer abcdefghijklmnopqrstuvwxyz",
+    ),
+)
+def test_rejects_private_or_sensitive_public_source_text(
+    tmp_path: Path, sentinel: str
+) -> None:
+    cases = [_case(index) for index in range(30)]
+    source = _source_for(cases)
+    source[30]["body"] = f"Do not retain {sentinel}."
+    manifest_path = _write_pack(tmp_path, cases=cases, source=source)
+
+    _assert_rejected(
+        manifest_path,
+        "benchmark_invalid_pack",
+        rejected_value=sentinel,
+    )
 
 
 def test_rejects_source_owner_that_is_not_defined_before_use(tmp_path: Path) -> None:
@@ -294,3 +351,33 @@ def test_rejects_candidate_label_referenced_by_an_ordinary_case(tmp_path: Path) 
     manifest_path = _write_pack(tmp_path, cases=cases, source=source)
 
     _assert_rejected(manifest_path, "benchmark_invalid_pack")
+
+
+def test_rejects_data_file_swapped_for_symlink_at_open_without_reading_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manifest_path = _write_pack(tmp_path)
+    source_path = tmp_path / "pilot-source.jsonl"
+    target_path = tmp_path / "outside-source.jsonl"
+    target_body = b"this target must not be read\n"
+    target_path.write_bytes(target_body)
+    original_open = benchmark_loading.os.open
+    original_hash = benchmark_loading.sha256_hex
+    hashed_bodies: list[bytes] = []
+
+    def swap_before_open(filename: str, flags: int, mode: int = 0o777) -> int:
+        if filename == os.fspath(source_path):
+            source_path.unlink()
+            source_path.symlink_to(target_path)
+        return original_open(filename, flags, mode)
+
+    def record_hash(value: bytes) -> str:
+        hashed_bodies.append(value)
+        return original_hash(value)
+
+    monkeypatch.setattr(benchmark_loading.os, "open", swap_before_open)
+    monkeypatch.setattr(benchmark_loading, "sha256_hex", record_hash)
+
+    _assert_rejected(manifest_path, "benchmark_invalid_pack")
+
+    assert target_body not in hashed_bodies

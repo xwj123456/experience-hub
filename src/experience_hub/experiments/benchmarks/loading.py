@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import stat
 from collections import Counter
+from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -27,7 +30,28 @@ from experience_hub.experiments.errors import ExperimentInputError
 
 _PRIVATE_PATH = re.compile(
     r"(?:^|[\s\"'])/(?:Users|home|private|tmp|var|opt|Volumes)(?:/|$)|"
-    r"(?:^|[\s\"'])[A-Za-z]:\\\\"
+    r"(?:^|[\s\"'])[A-Za-z]:[\\/]"
+)
+_ACCOUNT_IDENTIFIER = re.compile(
+    r"\b[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@"
+    r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+    r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+\b"
+)
+_CREDENTIAL_SENTINELS = (
+    re.compile(
+        r"\b(?:api[_-]?key|access[_-]?token|credential|password|secret|token)"
+        r"\s*[:=]\s*\S+",
+        re.IGNORECASE,
+    ),
+    re.compile(r"-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----"),
+    re.compile(
+        r"(?:Authorization[ \t]*:[ \t]*)?Bearer[ \t]+"
+        r"[A-Za-z0-9._~+/=-]{16,}",
+        re.IGNORECASE,
+    ),
+    re.compile(r"AKIA[0-9A-Z]{16}"),
+    re.compile(r"gh[pousr]_[A-Za-z0-9]{36,}"),
+    re.compile(r"sk-(?:proj-)?[A-Za-z0-9_-]{20,}"),
 )
 _SOURCE_RECORD: TypeAdapter[BenchmarkSourceRecordV1] = TypeAdapter(
     BenchmarkSourceRecordV1
@@ -56,17 +80,33 @@ def _reject(code: str, message: str) -> ExperimentInputError:
 def _read_bounded(path: Path) -> bytes:
     if not isinstance(path, Path):
         raise _reject("benchmark_invalid_pack", "benchmark input path is invalid")
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        raise _reject("benchmark_invalid_pack", "benchmark input cannot be opened")
+    descriptor: int | None = None
     try:
-        if path.is_symlink() or not path.is_file():
+        descriptor = os.open(os.fspath(path), os.O_RDONLY | nofollow)
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
             raise _reject("benchmark_invalid_pack", "benchmark input is not a file")
-        with path.open("rb") as handle:
-            body = handle.read(MAX_BENCHMARK_INPUT_BYTES + 1)
+        chunks: list[bytes] = []
+        remaining = MAX_BENCHMARK_INPUT_BYTES + 1
+        while remaining:
+            chunk = os.read(descriptor, remaining)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        body = b"".join(chunks)
     except ExperimentInputError:
         raise
     except OSError:
         raise _reject(
             "benchmark_invalid_pack", "benchmark input is unreadable"
         ) from None
+    finally:
+        if descriptor is not None:
+            with suppress(OSError):
+                os.close(descriptor)
     if len(body) > MAX_BENCHMARK_INPUT_BYTES:
         raise _reject("benchmark_resource_limit", "benchmark input exceeds byte limit")
     return body
@@ -165,7 +205,7 @@ def _validate_source_order(
             raise _reject(
                 "benchmark_invalid_pack", "benchmark source owner is unresolved"
             )
-        if previous_created_at is not None and record.created_at < previous_created_at:
+        if previous_created_at is not None and record.created_at <= previous_created_at:
             raise _reject("benchmark_invalid_pack", "benchmark source order is invalid")
         previous_created_at = record.created_at
         if isinstance(record, BenchmarkSourceExperienceV1):
@@ -178,31 +218,43 @@ def _validate_composition(
     manifest: BenchmarkPackManifestV1,
 ) -> None:
     composition = manifest.composition
-    if len(cases) != composition.case_count:
+    if (
+        composition.case_count,
+        composition.public_authored,
+        composition.reviewed_abstractions,
+        composition.cases_per_stratum,
+        composition.chinese,
+        composition.english,
+        composition.mixed,
+    ) != (30, 20, 10, 6, 10, 10, 10):
         raise _reject(
             "benchmark_invalid_pack", "benchmark composition does not match cases"
         )
     source_classes = Counter(case.source_class.value for case in cases)
     languages = Counter(case.language.value for case in cases)
     strata = Counter(case.stratum.value for case in cases)
-    if source_classes != {
-        "public_authored": composition.public_authored,
-        "reviewed_abstraction": composition.reviewed_abstractions,
-    }:
+    if (
+        len(cases),
+        source_classes["public_authored"],
+        source_classes["reviewed_abstraction"],
+    ) != (30, 20, 10):
         raise _reject(
             "benchmark_invalid_pack", "benchmark composition does not match cases"
         )
-    if languages != {
-        "zh": composition.chinese,
-        "en": composition.english,
-        "mixed": composition.mixed,
-    }:
+    if (languages["zh"], languages["en"], languages["mixed"]) != (10, 10, 10):
         raise _reject(
             "benchmark_invalid_pack", "benchmark composition does not match cases"
         )
-    if any(count != composition.cases_per_stratum for count in strata.values()) or len(
-        strata
-    ) != 5:
+    if tuple(
+        strata[stratum]
+        for stratum in (
+            "recurring_workflow",
+            "environment_gotcha",
+            "state_change",
+            "failure_recovery",
+            "irrelevant_distractor",
+        )
+    ) != (6, 6, 6, 6, 6):
         raise _reject(
             "benchmark_invalid_pack", "benchmark composition does not match cases"
         )
@@ -245,13 +297,20 @@ def _validate_case_closure(
             )
 
 
-def _contains_private_path(value: object) -> bool:
+def _contains_private_public_text(value: object) -> bool:
     if isinstance(value, str):
-        return _PRIVATE_PATH.search(value) is not None
+        return (
+            _PRIVATE_PATH.search(value) is not None
+            or _ACCOUNT_IDENTIFIER.search(value) is not None
+            or any(
+                pattern.search(value) is not None
+                for pattern in _CREDENTIAL_SENTINELS
+            )
+        )
     if isinstance(value, dict):
-        return any(_contains_private_path(item) for item in value.values())
+        return any(_contains_private_public_text(item) for item in value.values())
     if isinstance(value, (list, tuple)):
-        return any(_contains_private_path(item) for item in value)
+        return any(_contains_private_public_text(item) for item in value)
     return False
 
 
@@ -259,7 +318,7 @@ def _validate_public_text(
     cases: tuple[BenchmarkCaseV1, ...], source: tuple[BenchmarkSourceRecordV1, ...]
 ) -> None:
     if any(
-        _contains_private_path(item.model_dump(mode="json"))
+        _contains_private_public_text(item.model_dump(mode="json"))
         for item in (*cases, *source)
     ):
         raise _reject("benchmark_invalid_pack", "benchmark public text is invalid")
