@@ -5,6 +5,8 @@ import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pytest
+
 from experience_hub.canonical import canonical_json_bytes, sha256_hex
 from experience_hub.clock import FrozenClock
 from experience_hub.config import Settings
@@ -23,6 +25,8 @@ from experience_hub.experiments.benchmarks.source import (
     build_benchmark_source,
     search_document_bytes,
 )
+from experience_hub.experiments.errors import ExperimentInputError
+from experience_hub.experiments.snapshots import verify_source_unchanged
 from experience_hub.experiments.workspace import (
     REPLAY_WORKSPACE_POLICY,
     prepare_owned_workspace,
@@ -99,7 +103,7 @@ def _pack(tmp_path: Path) -> LoadedBenchmarkPack:
             record_type="experience",
             label="active-note",
             owner_label="alpha",
-            created_at=FROZEN_AT - timedelta(days=99),
+            created_at=FROZEN_AT - timedelta(days=2),
             temperature=Temperature.WARM,
             kind=ExperienceKind.PROCEDURAL,
             body="Keep the active workflow bounded.",
@@ -117,7 +121,7 @@ def _pack(tmp_path: Path) -> LoadedBenchmarkPack:
             record_type="candidate",
             label="pending-note",
             owner_label="alpha",
-            created_at=FROZEN_AT - timedelta(days=98),
+            created_at=FROZEN_AT - timedelta(days=1),
             kind=ExperienceKind.PROCEDURAL,
             body="Keep this pending candidate quarantined.",
             summary="Pending candidate stays quarantined.",
@@ -135,7 +139,7 @@ def _pack(tmp_path: Path) -> LoadedBenchmarkPack:
         active.model_copy(
             update={
                 "label": "forbidden-note",
-                "created_at": FROZEN_AT - timedelta(days=98),
+                "created_at": FROZEN_AT - timedelta(hours=20),
                 "body": "Do not apply the forbidden workflow.",
                 "summary": "Forbidden workflow.",
                 "mechanism": "Forbidden behavior is excluded.",
@@ -145,7 +149,7 @@ def _pack(tmp_path: Path) -> LoadedBenchmarkPack:
         active.model_copy(
             update={
                 "label": "stale-note",
-                "created_at": FROZEN_AT - timedelta(days=97),
+                "created_at": FROZEN_AT - timedelta(hours=16),
                 "body": "Do not apply the stale workflow.",
                 "summary": "Stale workflow.",
                 "mechanism": "Stale behavior is excluded.",
@@ -155,14 +159,14 @@ def _pack(tmp_path: Path) -> LoadedBenchmarkPack:
         active.model_copy(
             update={
                 "label": "misleading-note",
-                "created_at": FROZEN_AT - timedelta(days=96),
+                "created_at": FROZEN_AT - timedelta(hours=12),
                 "body": "Do not apply the misleading workflow.",
                 "summary": "Misleading workflow.",
                 "mechanism": "Misleading behavior is excluded.",
                 "tags": ("misleading",),
             }
         ),
-        candidate.model_copy(update={"created_at": FROZEN_AT - timedelta(days=95)}),
+        candidate.model_copy(update={"created_at": FROZEN_AT - timedelta(hours=8)}),
     )
     cases: list[dict[str, object]] = []
     for ordinal in range(30):
@@ -267,6 +271,9 @@ def test_build_source_is_deterministic_and_quarantines_pending_candidates(
 
     assert first.snapshot.database_sha256 == second.snapshot.database_sha256
     assert first.snapshot.database_bytes == second.snapshot.database_bytes
+    assert first.index.agent_ids == second.index.agent_ids
+    assert first.index.experience_ids == second.index.experience_ids
+    assert first.index.candidate_ids == second.index.candidate_ids
     active = next(
         record
         for record in pack.source
@@ -308,6 +315,16 @@ def test_build_source_is_deterministic_and_quarantines_pending_candidates(
         assert not Path(f"{built.path}-journal").exists()
         assert not Path(f"{built.path}.canonical").exists()
         asyncio.run(_verify_frozen_projection(built.path))
+        verify_source_unchanged(built.snapshot)
+        assert not any(
+            candidate.exists()
+            for candidate in (
+                Path(f"{built.path}-wal"),
+                Path(f"{built.path}-shm"),
+                Path(f"{built.path}-journal"),
+                Path(f"{built.path}.canonical"),
+            )
+        )
 
     with sqlite3.connect(first.path) as connection:
         experience_count = connection.execute(
@@ -316,5 +333,79 @@ def test_build_source_is_deterministic_and_quarantines_pending_candidates(
         candidate_count = connection.execute(
             "SELECT COUNT(*) FROM candidate_state WHERE decision = 'pending'"
         ).fetchone()
+        persisted_agents = dict(
+            connection.execute("SELECT name, agent_id FROM agents").fetchall()
+        )
+        persisted_experiences = dict(
+            connection.execute(
+                "SELECT experience_id, owner_agent_id FROM experiences"
+            ).fetchall()
+        )
+        persisted_candidates = dict(
+            connection.execute(
+                "SELECT candidate_id, owner_agent_id FROM candidate_state"
+            ).fetchall()
+        )
     assert experience_count == (5,)
     assert candidate_count == (1,)
+    assert persisted_agents == {
+        label: str(identifier) for label, identifier in first.index.agent_ids.items()
+    }
+    assert set(persisted_experiences) == {
+        str(identifier) for identifier in first.index.experience_ids.values()
+    }
+    assert set(persisted_candidates) == {
+        str(identifier) for identifier in first.index.candidate_ids.values()
+    }
+    for record in pack.source:
+        if isinstance(record, BenchmarkSourceExperienceV1):
+            experience_id = str(first.index.experience_ids[record.label])
+            assert persisted_experiences[experience_id] == str(
+                first.index.agent_ids[record.owner_label]
+            )
+        if isinstance(record, BenchmarkSourceCandidateV1):
+            candidate_id = str(first.index.candidate_ids[record.label])
+            assert persisted_candidates[candidate_id] == str(
+                first.index.agent_ids[record.owner_label]
+            )
+
+
+@pytest.mark.parametrize(
+    "failure_point", ("runtime", "command", "checkpoint", "freeze")
+)
+def test_source_failure_removes_only_its_owned_reservation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, failure_point: str
+) -> None:
+    from experience_hub.experiments.benchmarks import source as source_module
+
+    if failure_point == "runtime":
+        def fail_runtime_initialize(*_: object, **__: object) -> object:
+            raise RuntimeError("private runtime path")
+
+        monkeypatch.setattr(ApplicationRuntime, "initialize", fail_runtime_initialize)
+    elif failure_point == "command":
+        async def fail_command(*_: object, **__: object) -> object:
+            raise RuntimeError("private command path")
+
+        monkeypatch.setattr(source_module, "_create_agent", fail_command)
+    elif failure_point == "checkpoint":
+        def fail_checkpoint(*_: object, **__: object) -> object:
+            raise RuntimeError("private checkpoint path")
+
+        monkeypatch.setattr(source_module, "checkpoint_owned_sqlite", fail_checkpoint)
+    else:
+        def fail_freeze(*_: object, **__: object) -> object:
+            raise RuntimeError("private freeze path")
+
+        monkeypatch.setattr(source_module, "freeze_closed_sqlite", fail_freeze)
+
+    workspace = _workspace(tmp_path / "workspace")
+    with pytest.raises(ExperimentInputError) as captured:
+        asyncio.run(build_benchmark_source(_pack(tmp_path), workspace))
+
+    assert captured.value.code == "benchmark_source_invalid"
+    assert "private" not in str(captured.value)
+    assert not (workspace.root / "snapshot" / "source.sqlite3").exists()
+    assert not (workspace.root / "snapshot").exists()
+    assert not list(workspace.root.glob("snapshot/*.sqlite3*"))
+    assert not list(workspace.root.glob("snapshot/*.tmp"))

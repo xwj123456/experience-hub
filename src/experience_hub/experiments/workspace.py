@@ -15,6 +15,7 @@ import stat
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
+from typing import Literal
 
 from experience_hub.experiments.errors import ExperimentIsolationError
 
@@ -44,6 +45,85 @@ REPLAY_WORKSPACE_POLICY = WorkspacePolicy(
 )
 
 
+@dataclass(slots=True)
+class OwnedFileReservation:
+    """Keep one newly-created owned file and its workspace authority anchored."""
+
+    path: Path
+    _workspace: OwnedWorkspace
+    _parts: tuple[str, ...]
+    _root_fd: int
+    _parent_fd: int
+    _directories: list[tuple[int, str, int, bool]]
+    _status: os.stat_result
+    _committed: bool = False
+    _closed: bool = False
+
+    def __enter__(self) -> OwnedFileReservation:
+        return self
+
+    def __exit__(self, *_: object) -> Literal[False]:
+        try:
+            if not self._committed:
+                self.rollback()
+        finally:
+            self.close()
+        return False
+
+    def verify(self) -> None:
+        """Recheck the anchored root, parents, marker, and reserved inode."""
+        if self._closed:
+            raise _path_invalid()
+        _require_identity(
+            self._root_fd, self._workspace._device, self._workspace._inode
+        )
+        _validate_current_ownership(self._root_fd, self._workspace._policy)
+        _require_linked_directories(
+            [(parent, name, child) for parent, name, child, _ in self._directories]
+        )
+        _require_entry_identity(self._parts[-1], self._parent_fd, self._status)
+        _require_path_identity(self._workspace.root, self._root_fd)
+
+    def commit(self) -> None:
+        """Retain the exact reserved file after a final identity check."""
+        self.verify()
+        self._committed = True
+
+    def rollback(self) -> None:
+        """Remove only this reservation's retained inode and its empty parents."""
+        if self._closed:
+            return
+        self.verify()
+        for suffix in (
+            "-wal",
+            "-shm",
+            "-journal",
+            ".experience-hub.tmp",
+            ".experience-hub-clone.tmp",
+        ):
+            _unlink_regular_if_present(f"{self._parts[-1]}{suffix}", self._parent_fd)
+        _unlink_same_entry(self._parts[-1], self._parent_fd, self._status)
+        for parent_fd, name, child_fd, created in reversed(self._directories):
+            if not created:
+                continue
+            _require_entry_identity(name, parent_fd, os.fstat(child_fd))
+            try:
+                os.rmdir(name, dir_fd=parent_fd)
+            except OSError:
+                # A concurrent or pre-existing entry must be retained.
+                continue
+
+    def close(self) -> None:
+        """Release the file reservation's descriptors and advisory workspace lock."""
+        if self._closed:
+            return
+        self._closed = True
+        for _, _, directory_fd, _ in reversed(self._directories):
+            os.close(directory_fd)
+        _unlock_workspace(self._root_fd)
+        os.close(self._root_fd)
+
+
 @dataclass(frozen=True, slots=True)
 class OwnedWorkspace:
     """A validated workspace anchored to one immutable directory identity."""
@@ -57,6 +137,78 @@ class OwnedWorkspace:
         """Require the exact policy that established this anchored workspace."""
         if not isinstance(policy, WorkspacePolicy) or self._policy != policy:
             raise _path_invalid()
+
+    def reserve_new_file_scoped(
+        self, relative: PurePosixPath
+    ) -> OwnedFileReservation:
+        """Reserve a new file while retaining authority until commit or rollback."""
+        parts = _safe_relative_parts(relative)
+        if parts[0] not in self._policy.owned_entries:
+            raise _path_invalid()
+        root_fd = -1
+        parent_fd = -1
+        directories: list[tuple[int, str, int, bool]] = []
+        reservation: OwnedFileReservation | None = None
+        returned = False
+        try:
+            root_fd = _open_existing_root(self.root)
+            _lock_workspace(root_fd)
+            _require_identity(root_fd, self._device, self._inode)
+            _require_safe_relative_path(root_fd, parts)
+            _validate_current_ownership(root_fd, self._policy)
+            parent_fd = root_fd
+            for part in parts[:-1]:
+                try:
+                    os.stat(part, dir_fd=parent_fd, follow_symlinks=False)
+                    created = False
+                except FileNotFoundError:
+                    created = True
+                except OSError:
+                    raise _path_invalid() from None
+                child_fd = _open_or_create_directory(part, parent_fd)
+                directories.append((parent_fd, part, child_fd, created))
+                parent_fd = child_fd
+            _validate_regular_or_missing(parts[-1], parent_fd)
+            descriptor = os.open(
+                parts[-1],
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=parent_fd,
+            )
+            try:
+                status = os.fstat(descriptor)
+            finally:
+                os.close(descriptor)
+            if not stat.S_ISREG(status.st_mode):
+                raise _path_invalid()
+            reservation = OwnedFileReservation(
+                path=self.root.joinpath(*parts),
+                _workspace=self,
+                _parts=parts,
+                _root_fd=root_fd,
+                _parent_fd=parent_fd,
+                _directories=directories,
+                _status=status,
+            )
+            reservation.verify()
+            returned = True
+            return reservation
+        except ExperimentIsolationError:
+            raise
+        except OSError:
+            raise _write_failed() from None
+        finally:
+            # A returned reservation owns the lock and descriptors. Every other
+            # path must release them before reporting the stable isolation error.
+            if reservation is not None and not returned:
+                with suppress(ExperimentIsolationError):
+                    reservation.rollback()
+                reservation.close()
+            elif root_fd >= 0 and not returned:
+                for _, _, directory_fd, _ in reversed(directories):
+                    os.close(directory_fd)
+                _unlock_workspace(root_fd)
+                os.close(root_fd)
 
     def reserve_new_file(self, relative: PurePosixPath) -> Path:
         """Exclusively reserve one new owned file after revalidating the root."""
@@ -721,6 +873,21 @@ def _require_identity_status(
 def _lstat(name: str, directory_fd: int) -> os.stat_result:
     try:
         return os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except OSError:
+        raise _unowned() from None
+
+
+def _unlink_regular_if_present(name: str, directory_fd: int) -> None:
+    try:
+        status = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    except OSError:
+        raise _unowned() from None
+    if not stat.S_ISREG(status.st_mode):
+        raise _path_invalid()
+    try:
+        os.unlink(name, dir_fd=directory_fd)
     except OSError:
         raise _unowned() from None
 

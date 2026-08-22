@@ -36,6 +36,7 @@ from experience_hub.experiments.snapshots import (
     FrozenSqliteSnapshot,
     checkpoint_owned_sqlite,
     freeze_closed_sqlite,
+    verify_source_unchanged,
 )
 from experience_hub.experiments.workspace import (
     REPLAY_WORKSPACE_POLICY,
@@ -365,158 +366,161 @@ async def build_benchmark_source(
         workspace, OwnedWorkspace
     ):
         raise _invalid()
-    source_relative = PurePosixPath("snapshot/source.sqlite3")
     try:
         workspace.require_policy(REPLAY_WORKSPACE_POLICY)
-        path = workspace.reserve_new_file(source_relative)
-    except Exception:
-        raise _invalid() from None
-    content_records = tuple(
-        record for record in pack.source if record.record_type != "agent"
-    )
-    if not content_records:
-        raise _invalid()
-    clock = FrozenClock(
-        min(record.created_at for record in content_records)
-        - timedelta(
-            seconds=1
-            + sum(1 for record in pack.source if record.record_type == "agent")
-        )
-    )
-    runtime = ApplicationRuntime(
-        _settings(path),
-        clock=clock,
-        ids=_source_ids(pack),
-        container_factory=partial(
-            ApplicationContainer.build, lifecycle_config=PILOT_LIFECYCLE_CONFIG
-        ),
-    )
-    agent_ids: dict[str, UUID] = {}
-    experience_ids: dict[str, UUID] = {}
-    candidate_ids: dict[str, UUID] = {}
-    content_bytes: dict[str, int] = {}
-    try:
-        async with runtime.initialize(
-            start_lifecycle_worker=False, recover_interrupted=False
-        ) as container:
-            for ordinal, record in enumerate(pack.source, start=1):
-                if record.record_type != "agent":
-                    continue
-                clock.advance(timedelta(seconds=1))
-                agent_ids[record.label] = await _create_agent(
-                    container, label=record.label, ordinal=ordinal
+        source_relative = PurePosixPath("snapshot/source.sqlite3")
+        with workspace.reserve_new_file_scoped(source_relative) as reservation:
+            path = reservation.path
+            content_records = tuple(
+                record for record in pack.source if record.record_type != "agent"
+            )
+            if not content_records:
+                raise _invalid()
+            clock = FrozenClock(
+                min(record.created_at for record in content_records)
+                - timedelta(
+                    seconds=1
+                    + sum(1 for record in pack.source if record.record_type == "agent")
                 )
-            for ordinal, record in enumerate(pack.source, start=1):
-                if record.record_type == "agent":
-                    continue
-                owner_agent_id = agent_ids.get(record.owner_label)
-                if owner_agent_id is None:
-                    raise _invalid()
-                _advance_to(clock, record.created_at)
-                if isinstance(record, BenchmarkSourceExperienceV1):
-                    experience_ids[record.label] = await _create_experience(
-                        container,
-                        record=record,
-                        owner_agent_id=owner_agent_id,
-                        ordinal=ordinal,
-                    )
-                    content_bytes[record.label] = len(search_document_bytes(record))
-                elif isinstance(record, BenchmarkSourceCandidateV1):
-                    candidate_ids[record.label] = await _capture_candidate(
-                        container,
-                        record=record,
-                        owner_agent_id=owner_agent_id,
-                        ordinal=ordinal,
-                    )
-                else:
-                    raise _invalid()
-
-            if any(
-                isinstance(record, BenchmarkSourceExperienceV1)
-                and record.temperature.value == "archived"
-                for record in pack.source
-            ):
-                _advance_to(
-                    clock,
-                    pack.manifest.frozen_at - timedelta(days=91, seconds=901),
-                )
-                await _run_lifecycle(container, key="source-archive-prepare-first")
-                clock.advance(timedelta(seconds=901))
-                await _run_lifecycle(container, key="source-archive-prepare-second")
-            _advance_to(clock, pack.manifest.frozen_at - timedelta(seconds=901))
-            await _run_lifecycle(container, key="source-lifecycle-first")
-            _advance_to(clock, pack.manifest.frozen_at)
-            await _run_lifecycle(container, key="source-lifecycle-final")
-            async with container.database.read_session() as session:
-                for record in pack.source:
-                    if not isinstance(record, BenchmarkSourceExperienceV1):
+            )
+            runtime = ApplicationRuntime(
+                _settings(path),
+                clock=clock,
+                ids=_source_ids(pack),
+                container_factory=partial(
+                    ApplicationContainer.build, lifecycle_config=PILOT_LIFECYCLE_CONFIG
+                ),
+            )
+            agent_ids: dict[str, UUID] = {}
+            experience_ids: dict[str, UUID] = {}
+            candidate_ids: dict[str, UUID] = {}
+            content_bytes: dict[str, int] = {}
+            async with runtime.initialize(
+                start_lifecycle_worker=False, recover_interrupted=False
+            ) as container:
+                for ordinal, record in enumerate(pack.source, start=1):
+                    if record.record_type != "agent":
                         continue
-                    retrieval = (
-                        await container.experience_query.get_owned_retrieval_record(
-                            session=session,
-                            owner_agent_id=agent_ids[record.owner_label],
-                            experience_id=experience_ids[record.label],
-                        )
+                    clock.advance(timedelta(seconds=1))
+                    agent_ids[record.label] = await _create_agent(
+                        container, label=record.label, ordinal=ordinal
                     )
-                    if (
-                        retrieval is None
-                        or retrieval.state.temperature != record.temperature
-                    ):
+                for content_index, record in enumerate(content_records):
+                    owner_agent_id = agent_ids.get(record.owner_label)
+                    if owner_agent_id is None:
                         raise _invalid()
-                for record in pack.source:
-                    if not isinstance(record, BenchmarkSourceCandidateV1):
-                        continue
-                    candidate_id = candidate_ids[record.label]
-                    owner_agent_id = agent_ids[record.owner_label]
-                    candidate = await container.candidate_service.get_owned(
-                        session=session,
-                        owner_agent_id=owner_agent_id,
-                        candidate_id=candidate_id,
-                    )
-                    candidate_as_experience = (
-                        await container.experience_query.get_owned_retrieval_record(
+                    _advance_to(clock, record.created_at)
+                    ordinal = pack.source.index(record) + 1
+                    if isinstance(record, BenchmarkSourceExperienceV1):
+                        experience_ids[record.label] = await _create_experience(
+                            container,
+                            record=record,
+                            owner_agent_id=owner_agent_id,
+                            ordinal=ordinal,
+                        )
+                        content_bytes[record.label] = len(search_document_bytes(record))
+                        if record.temperature.value == "archived":
+                            first_cycle = record.created_at + timedelta(days=8)
+                            second_cycle = first_cycle + timedelta(seconds=901)
+                            if (
+                                content_index + 1 < len(content_records)
+                                and content_records[content_index + 1].created_at
+                                <= second_cycle
+                            ):
+                                raise _invalid()
+                            _advance_to(clock, first_cycle)
+                            await _run_lifecycle(
+                                container,
+                                key=f"source-archive-prepare-{content_index}-first",
+                            )
+                            _advance_to(clock, second_cycle)
+                            await _run_lifecycle(
+                                container,
+                                key=f"source-archive-prepare-{content_index}-second",
+                            )
+                    elif isinstance(record, BenchmarkSourceCandidateV1):
+                        candidate_ids[record.label] = await _capture_candidate(
+                            container,
+                            record=record,
+                            owner_agent_id=owner_agent_id,
+                            ordinal=ordinal,
+                        )
+                    else:
+                        raise _invalid()
+
+                _advance_to(clock, pack.manifest.frozen_at - timedelta(seconds=901))
+                await _run_lifecycle(container, key="source-lifecycle-first")
+                _advance_to(clock, pack.manifest.frozen_at)
+                await _run_lifecycle(container, key="source-lifecycle-final")
+                async with container.database.read_session() as session:
+                    for record in pack.source:
+                        if not isinstance(record, BenchmarkSourceExperienceV1):
+                            continue
+                        retrieval = (
+                            await container.experience_query.get_owned_retrieval_record(
+                                session=session,
+                                owner_agent_id=agent_ids[record.owner_label],
+                                experience_id=experience_ids[record.label],
+                            )
+                        )
+                        if (
+                            retrieval is None
+                            or retrieval.state.temperature != record.temperature
+                        ):
+                            raise _invalid()
+                    for record in pack.source:
+                        if not isinstance(record, BenchmarkSourceCandidateV1):
+                            continue
+                        candidate_id = candidate_ids[record.label]
+                        owner_agent_id = agent_ids[record.owner_label]
+                        candidate = await container.candidate_service.get_owned(
                             session=session,
                             owner_agent_id=owner_agent_id,
-                            experience_id=candidate_id,
+                            candidate_id=candidate_id,
                         )
-                    )
-                    if (
-                        candidate.candidate_id != candidate_id
-                        or candidate.owner_agent_id != owner_agent_id
-                        or candidate.decision is not CandidateDecision.PENDING
-                        or candidate_as_experience is not None
-                    ):
-                        raise _invalid()
-            verification = await container.projection_manager.verify(container.database)
-            if not verification.matches:
-                raise _invalid()
-    except ExperimentInputError:
-        raise
+                        candidate_as_experience = (
+                            await container.experience_query.get_owned_retrieval_record(
+                                session=session,
+                                owner_agent_id=owner_agent_id,
+                                experience_id=candidate_id,
+                            )
+                        )
+                        if (
+                            candidate.candidate_id != candidate_id
+                            or candidate.owner_agent_id != owner_agent_id
+                            or candidate.decision is not CandidateDecision.PENDING
+                            or candidate_as_experience is not None
+                        ):
+                            raise _invalid()
+                verification = await container.projection_manager.verify(
+                    container.database
+                )
+                if not verification.matches:
+                    raise _invalid()
+            reservation.verify()
+            await asyncio.to_thread(checkpoint_owned_sqlite, path)
+            snapshot = await asyncio.to_thread(freeze_closed_sqlite, path)
+            reservation.verify()
+            await asyncio.to_thread(verify_source_unchanged, snapshot)
+            reservation.commit()
+            source_index = BenchmarkSourceIndex(
+                agent_ids=MappingProxyType(dict(agent_ids)),
+                experience_ids=MappingProxyType(dict(experience_ids)),
+                candidate_ids=MappingProxyType(dict(candidate_ids)),
+                labels_by_experience_id=MappingProxyType(
+                    {value: label for label, value in experience_ids.items()}
+                ),
+                content_bytes_by_label=MappingProxyType(dict(content_bytes)),
+            )
+            return BuiltBenchmarkSource(
+                path=path,
+                snapshot=snapshot,
+                index=source_index,
+                schema_revision=pack.manifest.schema_version,
+            )
     except Exception:
         raise _invalid() from None
-
-    try:
-        workspace.require_owned_file(source_relative)
-        await asyncio.to_thread(checkpoint_owned_sqlite, path)
-        snapshot = await asyncio.to_thread(freeze_closed_sqlite, path)
-        workspace.require_owned_file(source_relative)
-    except Exception:
-        raise _invalid() from None
-    index = BenchmarkSourceIndex(
-        agent_ids=MappingProxyType(dict(agent_ids)),
-        experience_ids=MappingProxyType(dict(experience_ids)),
-        candidate_ids=MappingProxyType(dict(candidate_ids)),
-        labels_by_experience_id=MappingProxyType(
-            {value: label for label, value in experience_ids.items()}
-        ),
-        content_bytes_by_label=MappingProxyType(dict(content_bytes)),
-    )
-    return BuiltBenchmarkSource(
-        path=path,
-        snapshot=snapshot,
-        index=index,
-        schema_revision=pack.manifest.schema_version,
-    )
+    raise _invalid()
 
 
 __all__ = [

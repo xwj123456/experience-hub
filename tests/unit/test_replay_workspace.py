@@ -511,7 +511,7 @@ def test_atomic_write_rechecks_the_workspace_marker(tmp_path: Path) -> None:
     assert not (workspace.root / "artifacts").exists()
 
 
-def test_reserve_new_file_revalidates_marker_and_rejects_existing_target(
+def test_scoped_reservation_holds_workspace_lock_and_commits_reserved_file(
     tmp_path: Path,
 ) -> None:
     workspace = prepare_owned_workspace(
@@ -522,14 +522,85 @@ def test_reserve_new_file_revalidates_marker_and_rejects_existing_target(
     )
     relative = PurePosixPath("snapshot/source.sqlite3")
 
-    reserved = workspace.reserve_new_file(relative)
+    entered = Event()
+    completed = Event()
 
-    assert reserved == workspace.root / "snapshot" / "source.sqlite3"
-    with pytest.raises(ExperimentIsolationError):
-        workspace.reserve_new_file(relative)
-    (workspace.root / REPLAY_WORKSPACE_POLICY.marker_name).unlink()
-    with pytest.raises(ExperimentIsolationError):
-        workspace.require_owned_file(relative)
+    def replace_in_another_thread() -> None:
+        entered.set()
+        prepare_owned_workspace(
+            workspace.root,
+            policy=REPLAY_WORKSPACE_POLICY,
+            replace_owned=True,
+            allow_unmarked_empty=False,
+        )
+        completed.set()
+
+    with workspace.reserve_new_file_scoped(relative) as reservation:
+        assert reservation.path == workspace.root / "snapshot" / "source.sqlite3"
+        worker = Thread(target=replace_in_another_thread)
+        worker.start()
+        assert entered.wait(timeout=1)
+        assert not completed.wait(timeout=0.05)
+        reservation.commit()
+    worker.join(timeout=1)
+
+    assert completed.is_set()
+    assert not (workspace.root / relative).exists()
+
+
+def test_scoped_reservation_rejects_replacement_and_preserves_replacement_file(
+    tmp_path: Path,
+) -> None:
+    workspace = prepare_owned_workspace(
+        tmp_path / "workspace",
+        policy=REPLAY_WORKSPACE_POLICY,
+        replace_owned=False,
+        allow_unmarked_empty=False,
+    )
+    relative = PurePosixPath("snapshot/source.sqlite3")
+
+    with (
+        pytest.raises(ExperimentIsolationError),
+        workspace.reserve_new_file_scoped(relative) as reservation,
+    ):
+        reservation.path.unlink()
+        reservation.path.write_bytes(b"replacement")
+        reservation.verify()
+
+    assert (workspace.root / relative).read_bytes() == b"replacement"
+
+
+@pytest.mark.parametrize("replacement", ("root", "parent"))
+def test_scoped_reservation_detects_replaced_authority_without_removing_new_file(
+    tmp_path: Path, replacement: str
+) -> None:
+    workspace = prepare_owned_workspace(
+        tmp_path / "workspace",
+        policy=REPLAY_WORKSPACE_POLICY,
+        replace_owned=False,
+        allow_unmarked_empty=False,
+    )
+    relative = PurePosixPath("snapshot/source.sqlite3")
+
+    with (
+        pytest.raises(ExperimentIsolationError),
+        workspace.reserve_new_file_scoped(relative) as reservation,
+    ):
+        if replacement == "root":
+            workspace.root.rename(tmp_path / "displaced-workspace")
+            workspace.root.mkdir()
+            (workspace.root / REPLAY_WORKSPACE_POLICY.marker_name).write_bytes(
+                REPLAY_WORKSPACE_POLICY.marker_body
+            )
+            (workspace.root / "snapshot").mkdir()
+        else:
+            (workspace.root / "snapshot").rename(tmp_path / "displaced-snapshot")
+            (workspace.root / "snapshot").mkdir()
+        replacement_file = workspace.root / relative
+        replacement_file.write_bytes(b"replacement")
+        reservation.verify()
+
+    assert (workspace.root / relative).read_bytes() == b"replacement"
 
 
 def test_workspace_policy_requirement_rejects_a_different_marker_policy(
