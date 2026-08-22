@@ -101,7 +101,7 @@ def valid_source_experience_document() -> dict[str, object]:
         "mechanism": "Bounded recovery prevents duplicate work.",
         "tags": ["queue"],
         "applicability": ["bounded worker queue"],
-        "evidence": [{"type": "fixture", "id": "queue-evidence"}],
+        "evidence": [{"type": "fixture", "label": "queue-evidence"}],
         "falsifiers": ["The queue was never interrupted."],
         "importance_micros": 800000,
         "confidence_micros": 900000,

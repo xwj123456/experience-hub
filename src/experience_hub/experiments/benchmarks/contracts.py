@@ -16,7 +16,7 @@ from pydantic import (
     model_validator,
 )
 
-from experience_hub.domain import StrictModel, TypedEvidence
+from experience_hub.domain import StrictModel
 from experience_hub.experiences.models import ExperienceKind, Temperature
 from experience_hub.experiments.contracts import (
     MAX_REPLAY_CASES,
@@ -319,6 +319,19 @@ class BenchmarkSourceAgentV1(_BenchmarkModel):
         return _label(value, field_name="label")
 
 
+class BenchmarkSourceEvidenceV1(_BenchmarkModel):
+    """One logical source-evidence reference without a storage identity."""
+
+    type: str
+    label: str
+
+    @field_validator("type", "label", mode="before")
+    @classmethod
+    def validate_labels(cls, value: object, info: object) -> str:
+        field_name = getattr(info, "field_name", "label")
+        return _label(value, field_name=field_name)
+
+
 class _BenchmarkSourceContentV1(_BenchmarkModel):
     label: str
     owner_label: str
@@ -370,7 +383,7 @@ class BenchmarkSourceExperienceV1(_BenchmarkSourceContentV1):
     schema_version: Literal[1]
     record_type: Literal["experience"]
     temperature: Temperature
-    evidence: tuple[TypedEvidence, ...]
+    evidence: tuple[BenchmarkSourceEvidenceV1, ...]
     importance_micros: UtilityMicros
     confidence_micros: UtilityMicros
 
@@ -569,6 +582,17 @@ class BenchmarkSafetyEvidenceV1(_BenchmarkModel):
     source_unchanged: StrictBool
     clone_isolation_verified: StrictBool
 
+    @property
+    def is_safe(self) -> bool:
+        return (
+            self.owner_leak_count == 0
+            and self.quarantine_leak_count == 0
+            and self.cross_arm_contamination_count == 0
+            and self.source_mutation_count == 0
+            and self.source_unchanged
+            and self.clone_isolation_verified
+        )
+
 
 class BenchmarkDeltaAggregateV1(_BenchmarkModel):
     schema_version: Literal[1]
@@ -582,6 +606,10 @@ class BenchmarkDeltaAggregateV1(_BenchmarkModel):
     def validate_scope(cls, value: object) -> str:
         if value == "overall":
             return "overall"
+        if isinstance(value, str) and value in {
+            item.value for item in BENCHMARK_STRATUM_ORDER
+        }:
+            return value
         return _label(value, field_name="scope")
 
     @model_validator(mode="after")
@@ -608,6 +636,13 @@ class BenchmarkAggregateV1(_BenchmarkModel):
         ) != expected:
             raise ValueError("strata must use the fixed benchmark stratum order")
         return self
+
+
+def _validate_pilot_aggregate(aggregate: BenchmarkAggregateV1) -> None:
+    if aggregate.overall.case_count != 30:
+        raise ValueError("overall aggregate must contain exactly 30 cases")
+    if any(item.case_count != 6 for item in aggregate.strata):
+        raise ValueError("each stratum aggregate must contain exactly 6 cases")
 
 
 class BenchmarkGateResultV1(_BenchmarkModel):
@@ -693,13 +728,20 @@ class BenchmarkPassPayloadV1(_BenchmarkModel):
     @model_validator(mode="after")
     def validate_payload_cases(self) -> Self:
         case_ids = tuple(case.case_id for case in self.cases)
-        if not case_ids or len(case_ids) != len(set(case_ids)):
-            raise ValueError("cases must contain at least one unique case ID")
+        if len(case_ids) != 30 or len(case_ids) != len(set(case_ids)):
+            raise ValueError("cases must contain exactly 30 unique case IDs")
+        if any(
+            sum(case.stratum is stratum for case in self.cases) != 6
+            for stratum in BENCHMARK_STRATUM_ORDER
+        ):
+            raise ValueError("cases must contain exactly 6 cases per stratum")
         complete = all(case.status == "complete" for case in self.cases)
         if self.comparison_complete != complete:
             raise ValueError("comparison_complete must match case completeness")
         if (self.aggregate is not None) != complete:
             raise ValueError("aggregate is present only for complete comparisons")
+        if self.aggregate is not None:
+            _validate_pilot_aggregate(self.aggregate)
         return self
 
 
@@ -714,8 +756,18 @@ class BenchmarkEvidenceDataV1(_BenchmarkModel):
     @model_validator(mode="after")
     def validate_gates(self) -> Self:
         gate_ids = tuple(gate.gate_id for gate in self.gates)
-        if len(gate_ids) != len(set(gate_ids)):
-            raise ValueError("gates must contain unique gate IDs")
+        if not gate_ids or len(gate_ids) != len(set(gate_ids)):
+            raise ValueError("gates must contain at least one unique gate ID")
+        expected_valid = (
+            self.pass_payload.comparison_complete
+            and self.deterministic_replay_match
+            and self.pass_payload.safety.is_safe
+        )
+        if self.valid != expected_valid:
+            raise ValueError("valid must match completeness, replay, and safety")
+        expected_expansion = expected_valid and all(gate.passed for gate in self.gates)
+        if self.expansion_gate_passed != expected_expansion:
+            raise ValueError("expansion_gate_passed must match valid gate results")
         return self
 
 
@@ -731,8 +783,8 @@ class BenchmarkSummaryDataV1(_BenchmarkModel):
     source_fixture_sha256: str
     snapshot_sha256: str
     evidence_sha256: str
-    case_count: Annotated[StrictInt, Field(ge=1, le=MAX_REPLAY_CASES)]
-    arm_count: Annotated[StrictInt, Field(ge=1, le=len(BENCHMARK_ARM_ORDER))]
+    case_count: Literal[30]
+    arm_count: Literal[4]
     comparison_complete: StrictBool
     deterministic_replay_match: StrictBool
     safety: BenchmarkSafetyEvidenceV1
@@ -766,6 +818,27 @@ class BenchmarkSummaryDataV1(_BenchmarkModel):
         if not isinstance(value, str) or not value.strip():
             raise ValueError("claim_boundary must be nonempty")
         return value
+
+    @model_validator(mode="after")
+    def validate_summary_state(self) -> Self:
+        if (self.aggregate is not None) != self.comparison_complete:
+            raise ValueError("aggregate is present only for complete comparisons")
+        if self.aggregate is not None:
+            _validate_pilot_aggregate(self.aggregate)
+        gate_ids = tuple(gate.gate_id for gate in self.gates)
+        if not gate_ids or len(gate_ids) != len(set(gate_ids)):
+            raise ValueError("gates must contain at least one unique gate ID")
+        expected_valid = (
+            self.comparison_complete
+            and self.deterministic_replay_match
+            and self.safety.is_safe
+        )
+        if self.valid != expected_valid:
+            raise ValueError("valid must match completeness, replay, and safety")
+        expected_expansion = expected_valid and all(gate.passed for gate in self.gates)
+        if self.expansion_gate_passed != expected_expansion:
+            raise ValueError("expansion_gate_passed must match valid gate results")
+        return self
 
 
 class BenchmarkSummaryReportV1(_BenchmarkModel):
@@ -830,6 +903,7 @@ __all__ = [
     "BenchmarkSourceAgentV1",
     "BenchmarkSourceCandidateV1",
     "BenchmarkSourceClass",
+    "BenchmarkSourceEvidenceV1",
     "BenchmarkSourceExperienceV1",
     "BenchmarkSourceRecordV1",
     "BenchmarkStratum",
@@ -871,4 +945,6 @@ class BenchmarkPackManifestV1(_BenchmarkModel):
     @model_validator(mode="after")
     def validate_required_arm_order(self) -> Self:
         _require_ordered_benchmark_arms(self.arms)
+        if self.cases.file == self.source.file:
+            raise ValueError("cases and source files must be distinct")
         return self
