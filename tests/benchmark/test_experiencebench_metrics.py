@@ -366,6 +366,24 @@ def test_different_complete_passes_fail_only_the_deterministic_replay_gate() -> 
             schema_version=1,
             owner_leak_count=0,
             quarantine_leak_count=0,
+            cross_arm_contamination_count=1,
+            source_mutation_count=0,
+            source_unchanged=True,
+            clone_isolation_verified=True,
+        ),
+        BenchmarkSafetyEvidenceV1(
+            schema_version=1,
+            owner_leak_count=0,
+            quarantine_leak_count=0,
+            cross_arm_contamination_count=0,
+            source_mutation_count=1,
+            source_unchanged=True,
+            clone_isolation_verified=True,
+        ),
+        BenchmarkSafetyEvidenceV1(
+            schema_version=1,
+            owner_leak_count=0,
+            quarantine_leak_count=0,
             cross_arm_contamination_count=0,
             source_mutation_count=0,
             source_unchanged=False,
@@ -394,6 +412,35 @@ def test_each_owner_candidate_or_verification_safety_failure_fails_safety_gate(
 
     gates = _gate_state(payload)
 
+    assert gates["safety"] is False
+
+
+def test_unsafe_second_pass_fails_safety_without_obscuring_other_gate_dimensions(
+) -> None:
+    cases = _thirty_cases((50_000,) * 30)
+    first = _constructed_payload(
+        cases=cases,
+        aggregate=aggregate_benchmark_cases(cases),
+    )
+    unsafe_second = first.model_copy(
+        update={
+            "safety": BenchmarkSafetyEvidenceV1(
+                schema_version=1,
+                owner_leak_count=0,
+                quarantine_leak_count=0,
+                cross_arm_contamination_count=0,
+                source_mutation_count=1,
+                source_unchanged=True,
+                clone_isolation_verified=True,
+            )
+        }
+    )
+
+    gates = _gate_state_for_two_passes(first, unsafe_second)
+
+    assert gates["comparison_complete"] is True
+    assert gates["complete_arms"] is True
+    assert gates["deterministic_replay"] is False
     assert gates["safety"] is False
 
 
@@ -474,6 +521,46 @@ def test_missing_or_duplicate_aggregate_strata_fail_comparison_completeness(
         schema_version=1,
         overall=aggregate.overall,
         strata=invalid_strata,
+    )
+    payload = _constructed_payload(cases=cases, aggregate=invalid_aggregate)
+
+    gates = _gate_state(payload)
+
+    assert gates["comparison_complete"] is False
+    assert gates["complete_arms"] is False
+
+
+def test_wrong_aggregate_overall_case_count_fails_comparison_completeness() -> None:
+    cases = _thirty_cases((50_000,) * 30)
+    aggregate = aggregate_benchmark_cases(cases)
+    assert aggregate is not None
+    wrong_overall = aggregate.overall.model_construct(
+        **{**aggregate.overall.__dict__, "case_count": 29}
+    )
+    invalid_aggregate = aggregate.model_construct(
+        schema_version=1,
+        overall=wrong_overall,
+        strata=aggregate.strata,
+    )
+    payload = _constructed_payload(cases=cases, aggregate=invalid_aggregate)
+
+    gates = _gate_state(payload)
+
+    assert gates["comparison_complete"] is False
+    assert gates["complete_arms"] is False
+
+
+def test_wrong_aggregate_stratum_case_count_fails_comparison_completeness() -> None:
+    cases = _thirty_cases((50_000,) * 30)
+    aggregate = aggregate_benchmark_cases(cases)
+    assert aggregate is not None
+    wrong_stratum = aggregate.strata[2].model_construct(
+        **{**aggregate.strata[2].__dict__, "case_count": 5}
+    )
+    invalid_aggregate = aggregate.model_construct(
+        schema_version=1,
+        overall=aggregate.overall,
+        strata=(*aggregate.strata[:2], wrong_stratum, *aggregate.strata[3:]),
     )
     payload = _constructed_payload(cases=cases, aggregate=invalid_aggregate)
 
