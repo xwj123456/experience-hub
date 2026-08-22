@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -34,8 +34,8 @@ from experience_hub.experiments.policies import (
     PolicyExecutionContext,
 )
 from experience_hub.experiments.policy_clones import (
-    PolicyCloneIdentity,
-    require_safe_policy_clone,
+    PolicyCloneLease,
+    acquire_policy_clone_lease,
     require_same_policy_clone,
 )
 
@@ -52,15 +52,16 @@ CREATE VIRTUAL TABLE pilot_fts USING fts5(
 _OWNER_VISIBLE_ROWS_SQL = """
 SELECT experiences.experience_id, experiences.created_at,
        experience_versions.summary, experience_versions.mechanism,
-       experience_versions.tags, experience_versions.applicability
+       experience_versions.tags, experience_versions.applicability,
+       experience_state.owner_agent_id, experience_state.temperature,
+       experience_versions.experience_id
 FROM experiences
-JOIN experience_state
+LEFT JOIN experience_state
   ON experience_state.experience_id = experiences.experience_id
-JOIN experience_versions
+LEFT JOIN experience_versions
   ON experience_versions.version_id = experience_state.current_version_id
+ AND experience_versions.experience_id = experiences.experience_id
 WHERE experiences.owner_agent_id = ?
-  AND experience_state.owner_agent_id = ?
-  AND experience_state.temperature != 'archived'
 """
 
 
@@ -138,31 +139,52 @@ def _select_prefix(
     )
 
 
-def _same_clone_or_raise(identity: PolicyCloneIdentity) -> None:
-    try:
-        require_same_policy_clone(identity)
-    except ExperimentIsolationError:
-        raise _execution_failed() from None
-
-
 def _owner_visible_records(
     connection: sqlite3.Connection,
     context: BenchmarkPolicyContext,
 ) -> tuple[_OwnedRecord, ...]:
     rows = connection.execute(
         _OWNER_VISIBLE_ROWS_SQL,
-        (str(context.owner_agent_id), str(context.owner_agent_id)),
+        (str(context.owner_agent_id),),
     ).fetchall()
     records: list[_OwnedRecord] = []
-    for experience_id, created_at, summary, mechanism, tags, applicability in rows:
+    for (
+        experience_id,
+        created_at,
+        summary,
+        mechanism,
+        tags,
+        applicability,
+        state_owner,
+        temperature,
+        version_experience_id,
+    ) in rows:
+        if not all(
+            isinstance(value, str)
+            for value in (
+                experience_id,
+                created_at,
+                summary,
+                mechanism,
+                state_owner,
+                temperature,
+                version_experience_id,
+            )
+        ):
+            raise _execution_failed()
+        if (
+            state_owner != str(context.owner_agent_id)
+            or version_experience_id != experience_id
+        ):
+            raise _execution_failed()
+        if temperature not in {"archived", "hot", "warm", "cold"}:
+            raise _execution_failed()
+        if temperature == "archived":
+            continue
         try:
             label = context.source_index.labels_by_experience_id[UUID(experience_id)]
         except (KeyError, TypeError, ValueError):
             raise _oracle_invalid() from None
-        if not all(
-            isinstance(value, str) for value in (created_at, summary, mechanism)
-        ):
-            raise _execution_failed()
         records.append(
             _OwnedRecord(
                 label=label,
@@ -189,10 +211,10 @@ def _json_terms(value: object) -> str:
 
 
 def _recent_notes(
-    identity: PolicyCloneIdentity,
+    lease: PolicyCloneLease,
     context: BenchmarkPolicyContext,
 ) -> BenchmarkArmObservationV1:
-    with sqlite3.connect(identity.path) as connection:
+    with sqlite3.connect(lease.sqlite_uri, uri=True) as connection:
         records = _owner_visible_records(connection, context)
     ranked = sorted(records, key=lambda record: record.label)
     ranked.sort(key=lambda record: record.created_at, reverse=True)
@@ -228,10 +250,11 @@ def preflight_benchmark_capabilities() -> None:
 
 
 def _sqlite_bm25(
-    identity: PolicyCloneIdentity,
+    lease: PolicyCloneLease,
     context: BenchmarkPolicyContext,
 ) -> BenchmarkArmObservationV1:
-    with sqlite3.connect(identity.path) as connection:
+    with sqlite3.connect(lease.sqlite_uri, uri=True) as connection:
+        connection.execute("PRAGMA journal_mode = MEMORY")
         connection.execute(_FTS_SQL)
         records = _owner_visible_records(connection, context)
         connection.executemany(
@@ -256,6 +279,62 @@ def _sqlite_bm25(
     return _select_prefix(context, (row[0] for row in rows))
 
 
+type CloneOperation = Callable[
+    [PolicyCloneLease, BenchmarkPolicyContext], BenchmarkArmObservationV1
+]
+
+
+def _run_with_clone_lease(
+    context: BenchmarkPolicyContext,
+    operation: CloneOperation,
+    *,
+    preflight: bool,
+) -> BenchmarkArmObservationV1:
+    if preflight:
+        preflight_benchmark_capabilities()
+    lease = acquire_policy_clone_lease(context.clone_path)
+    try:
+        try:
+            return operation(lease, context)
+        finally:
+            require_same_policy_clone(lease.identity)
+    except ExperimentInputError:
+        raise
+    except (ExperimentIsolationError, OSError, sqlite3.DatabaseError):
+        raise _execution_failed() from None
+    finally:
+        try:
+            lease.close()
+        except ExperimentIsolationError:
+            raise _execution_failed() from None
+
+
+async def _complete_threaded[T](
+    operation: Callable[..., T],
+    *arguments: object,
+    **keywords: object,
+) -> T:
+    """Drain retained clone work before re-raising the first cancellation."""
+    worker = asyncio.create_task(asyncio.to_thread(operation, *arguments, **keywords))
+    cancellation: asyncio.CancelledError | None = None
+    while True:
+        try:
+            result = await asyncio.shield(worker)
+        except asyncio.CancelledError as error:
+            if cancellation is None:
+                cancellation = error
+            continue
+        except Exception:
+            if cancellation is None:
+                raise
+            break
+        if cancellation is not None:
+            raise cancellation
+        return result
+    assert cancellation is not None
+    raise cancellation
+
+
 @dataclass(frozen=True, slots=True)
 class NoMemoryBenchmarkPolicyArm:
     descriptor: BenchmarkArmDescriptorV1
@@ -278,15 +357,17 @@ class RecentNotesPolicyArm:
     async def execute(
         self, context: BenchmarkPolicyContext
     ) -> BenchmarkArmObservationV1:
-        identity = require_safe_policy_clone(context.clone_path)
         try:
-            return await asyncio.to_thread(_recent_notes, identity, context)
+            return await _complete_threaded(
+                _run_with_clone_lease,
+                context,
+                _recent_notes,
+                preflight=False,
+            )
         except ExperimentInputError:
             raise
         except (ExperimentIsolationError, OSError, sqlite3.DatabaseError):
             raise _execution_failed() from None
-        finally:
-            _same_clone_or_raise(identity)
 
 
 @dataclass(frozen=True, slots=True)
@@ -296,16 +377,17 @@ class SqliteBm25PolicyArm:
     async def execute(
         self, context: BenchmarkPolicyContext
     ) -> BenchmarkArmObservationV1:
-        preflight_benchmark_capabilities()
-        identity = require_safe_policy_clone(context.clone_path)
         try:
-            return await asyncio.to_thread(_sqlite_bm25, identity, context)
+            return await _complete_threaded(
+                _run_with_clone_lease,
+                context,
+                _sqlite_bm25,
+                preflight=True,
+            )
         except ExperimentInputError:
             raise
         except (ExperimentIsolationError, OSError, sqlite3.DatabaseError):
             raise _execution_failed() from None
-        finally:
-            _same_clone_or_raise(identity)
 
 
 @dataclass(frozen=True, slots=True)
@@ -361,6 +443,11 @@ def build_benchmark_policy(
     """Build only one of the four fixed first-party benchmark baselines."""
     if not isinstance(descriptor, BenchmarkArmDescriptorV1):
         raise TypeError("descriptor must be BenchmarkArmDescriptorV1")
+    if not isinstance(descriptor.kind, BenchmarkArmKind):
+        raise ExperimentInputError(
+            "benchmark_policy_unsupported",
+            "Benchmark policy kind is not supported",
+        )
     match descriptor.kind:
         case BenchmarkArmKind.NO_MEMORY:
             return NoMemoryBenchmarkPolicyArm(descriptor)

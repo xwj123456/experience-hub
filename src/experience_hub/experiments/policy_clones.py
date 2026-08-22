@@ -23,6 +23,11 @@ _FILE_FLAGS = (
     | getattr(os, "O_CLOEXEC", 0)
     | getattr(os, "O_NOFOLLOW", 0)
 )
+_WRITABLE_FILE_FLAGS = (
+    os.O_RDWR
+    | getattr(os, "O_CLOEXEC", 0)
+    | getattr(os, "O_NOFOLLOW", 0)
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -32,6 +37,29 @@ class PolicyCloneIdentity:
     path: Path
     device: int
     inode: int
+
+
+@dataclass(slots=True)
+class PolicyCloneLease:
+    """Descriptor-retained clone authority for one synchronous SQLite operation."""
+
+    identity: PolicyCloneIdentity
+    descriptor: int
+
+    @property
+    def sqlite_uri(self) -> str:
+        if self.descriptor < 0:
+            raise _clone_error()
+        return f"file:/dev/fd/{self.descriptor}?mode=rw&cache=private"
+
+    def close(self) -> None:
+        if self.descriptor >= 0:
+            descriptor = self.descriptor
+            self.descriptor = -1
+            try:
+                os.close(descriptor)
+            except OSError:
+                raise _clone_error() from None
 
 
 def _clone_error() -> ExperimentIsolationError:
@@ -67,8 +95,11 @@ def _open_clone_parent(path: Path) -> int:
         raise
 
 
-def require_safe_policy_clone(path: Path) -> PolicyCloneIdentity:
-    """Retain one regular single-link clone without following symlinks."""
+def _retain_safe_policy_clone(
+    path: Path,
+    *,
+    file_flags: int,
+) -> tuple[PolicyCloneIdentity, int]:
     if not isinstance(path, Path):
         raise _clone_error()
     absolute = path.absolute()
@@ -93,7 +124,11 @@ def require_safe_policy_clone(path: Path) -> PolicyCloneIdentity:
         )
         if not stat.S_ISREG(retained.st_mode) or retained.st_nlink != 1:
             raise _clone_error()
-        clone_descriptor = os.open(absolute.name, _FILE_FLAGS, dir_fd=parent_descriptor)
+        clone_descriptor = os.open(
+            absolute.name,
+            file_flags,
+            dir_fd=parent_descriptor,
+        )
         opened = os.fstat(clone_descriptor)
         declared = os.stat(absolute, follow_symlinks=False)
         if (
@@ -103,11 +138,12 @@ def require_safe_policy_clone(path: Path) -> PolicyCloneIdentity:
             or not _same_identity(opened, declared)
         ):
             raise _clone_error()
-        return PolicyCloneIdentity(
-            path=absolute,
-            device=opened.st_dev,
-            inode=opened.st_ino,
+        identity = PolicyCloneIdentity(
+            path=absolute, device=opened.st_dev, inode=opened.st_ino
         )
+        retained_descriptor = clone_descriptor
+        clone_descriptor = -1
+        return identity, retained_descriptor
     except ExperimentIsolationError:
         raise
     except OSError:
@@ -117,6 +153,27 @@ def require_safe_policy_clone(path: Path) -> PolicyCloneIdentity:
             os.close(clone_descriptor)
         if parent_descriptor >= 0:
             os.close(parent_descriptor)
+
+
+def require_safe_policy_clone(path: Path) -> PolicyCloneIdentity:
+    """Retain one regular single-link clone without following symlinks."""
+    identity, descriptor = _retain_safe_policy_clone(path, file_flags=_FILE_FLAGS)
+    try:
+        return identity
+    finally:
+        try:
+            os.close(descriptor)
+        except OSError:
+            raise _clone_error() from None
+
+
+def acquire_policy_clone_lease(path: Path) -> PolicyCloneLease:
+    """Keep a writable clone descriptor bound through one SQLite operation."""
+    identity, descriptor = _retain_safe_policy_clone(
+        path,
+        file_flags=_WRITABLE_FILE_FLAGS,
+    )
+    return PolicyCloneLease(identity=identity, descriptor=descriptor)
 
 
 def require_same_policy_clone(identity: PolicyCloneIdentity) -> None:
