@@ -6,6 +6,7 @@ import asyncio
 import json
 import sqlite3
 from collections.abc import Callable, Iterable
+from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -214,7 +215,7 @@ def _recent_notes(
     lease: PolicyCloneLease,
     context: BenchmarkPolicyContext,
 ) -> BenchmarkArmObservationV1:
-    with sqlite3.connect(lease.sqlite_uri, uri=True) as connection:
+    with closing(sqlite3.connect(lease.sqlite_uri, uri=True)) as connection, connection:
         records = _owner_visible_records(connection, context)
     ranked = sorted(records, key=lambda record: record.label)
     ranked.sort(key=lambda record: record.created_at, reverse=True)
@@ -253,7 +254,7 @@ def _sqlite_bm25(
     lease: PolicyCloneLease,
     context: BenchmarkPolicyContext,
 ) -> BenchmarkArmObservationV1:
-    with sqlite3.connect(lease.sqlite_uri, uri=True) as connection:
+    with closing(sqlite3.connect(lease.sqlite_uri, uri=True)) as connection, connection:
         connection.execute("PRAGMA journal_mode = MEMORY")
         connection.execute(_FTS_SQL)
         records = _owner_visible_records(connection, context)

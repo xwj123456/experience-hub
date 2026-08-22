@@ -419,6 +419,8 @@ async def test_bm25_drains_worker_before_double_cancellation_is_reraised(
     try:
         await asyncio.to_thread(started.wait)
         task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
         task.cancel()
         await asyncio.sleep(0)
         assert not task.done()
@@ -426,6 +428,168 @@ async def test_bm25_drains_worker_before_double_cancellation_is_reraised(
         release.set()
     with pytest.raises(asyncio.CancelledError):
         await task
+
+
+@pytest.mark.parametrize(
+    "kind",
+    (BenchmarkArmKind.RECENT_NOTES, BenchmarkArmKind.SQLITE_BM25),
+)
+@pytest.mark.asyncio
+async def test_policy_connection_closes_before_lease_cleanup_on_ordinary_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    kind: BenchmarkArmKind,
+) -> None:
+    from experience_hub.experiments.benchmarks import policies as policy_module
+    from experience_hub.experiments.benchmarks.policies import build_benchmark_policy
+
+    clone_path = tmp_path / f"{kind.value}-ordinary-error.sqlite3"
+    _clone_with_owned_records(clone_path)
+    events: list[str] = []
+    original_connect = sqlite3.connect
+    original_verify = policy_module.require_same_policy_clone
+    original_lease_close = policy_module.PolicyCloneLease.close
+
+    class Connection:
+        def __enter__(self) -> Connection:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            events.append("transaction-exit")
+            return None
+
+        def close(self) -> None:
+            events.append("connection-close")
+
+        def execute(
+            self,
+            statement: str,
+            values: tuple[object, ...] = (),
+        ) -> Connection:
+            del statement, values
+            raise sqlite3.DatabaseError("ordinary-error")
+
+    connection = Connection()
+
+    def connect(database: object, *args: object, **kwargs: object) -> object:
+        if database == ":memory:":
+            return original_connect(database, *args, **kwargs)
+        return connection
+
+    def verify(identity: object) -> None:
+        events.append("lease-verify")
+        original_verify(identity)
+
+    def close(lease: object) -> None:
+        events.append("lease-close")
+        original_lease_close(lease)
+
+    monkeypatch.setattr(policy_module.sqlite3, "connect", connect)
+    monkeypatch.setattr(policy_module, "require_same_policy_clone", verify)
+    monkeypatch.setattr(policy_module.PolicyCloneLease, "close", close)
+    task = asyncio.create_task(
+        build_benchmark_policy(_descriptor(kind)).execute(_context(clone_path))
+    )
+    task.add_done_callback(lambda _: events.append("coroutine-complete"))
+
+    with pytest.raises(ExperimentIsolationError) as raised:
+        await task
+    await asyncio.sleep(0)
+
+    assert raised.value.code == "benchmark_policy_execution_failed"
+    assert events == [
+        "transaction-exit",
+        "connection-close",
+        "lease-verify",
+        "lease-close",
+        "coroutine-complete",
+    ]
+
+
+@pytest.mark.parametrize(
+    "kind",
+    (BenchmarkArmKind.RECENT_NOTES, BenchmarkArmKind.SQLITE_BM25),
+)
+@pytest.mark.asyncio
+async def test_cancelled_policy_connection_closes_before_lease_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    kind: BenchmarkArmKind,
+) -> None:
+    from experience_hub.experiments.benchmarks import policies as policy_module
+    from experience_hub.experiments.benchmarks.policies import build_benchmark_policy
+
+    clone_path = tmp_path / f"{kind.value}-cancelled-error.sqlite3"
+    _clone_with_owned_records(clone_path)
+    events: list[str] = []
+    started = threading.Event()
+    release = threading.Event()
+    original_connect = sqlite3.connect
+    original_verify = policy_module.require_same_policy_clone
+    original_lease_close = policy_module.PolicyCloneLease.close
+
+    class Connection:
+        def __enter__(self) -> Connection:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            events.append("transaction-exit")
+            return None
+
+        def close(self) -> None:
+            events.append("connection-close")
+
+        def execute(
+            self,
+            statement: str,
+            values: tuple[object, ...] = (),
+        ) -> Connection:
+            del statement, values
+            started.set()
+            release.wait()
+            raise sqlite3.DatabaseError("cancelled-error")
+
+    connection = Connection()
+
+    def connect(database: object, *args: object, **kwargs: object) -> object:
+        if database == ":memory:":
+            return original_connect(database, *args, **kwargs)
+        return connection
+
+    def verify(identity: object) -> None:
+        events.append("lease-verify")
+        original_verify(identity)
+
+    def close(lease: object) -> None:
+        events.append("lease-close")
+        original_lease_close(lease)
+
+    monkeypatch.setattr(policy_module.sqlite3, "connect", connect)
+    monkeypatch.setattr(policy_module, "require_same_policy_clone", verify)
+    monkeypatch.setattr(policy_module.PolicyCloneLease, "close", close)
+    task = asyncio.create_task(
+        build_benchmark_policy(_descriptor(kind)).execute(_context(clone_path))
+    )
+    task.add_done_callback(lambda _: events.append("coroutine-complete"))
+    try:
+        await asyncio.to_thread(started.wait)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+    finally:
+        release.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await asyncio.sleep(0)
+
+    assert events == [
+        "transaction-exit",
+        "connection-close",
+        "lease-verify",
+        "lease-close",
+        "coroutine-complete",
+    ]
 
 
 @pytest.mark.asyncio
