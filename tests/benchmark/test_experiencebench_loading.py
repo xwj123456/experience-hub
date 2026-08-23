@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+from collections import Counter
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -23,6 +24,89 @@ from experience_hub.experiments.benchmarks.contracts import (
 )
 from experience_hub.experiments.benchmarks.loading import load_benchmark_pack
 from experience_hub.experiments.errors import ExperimentInputError
+
+REPOSITORY_ROOT = Path(__file__).parents[2]
+PILOT_MANIFEST = (
+    REPOSITORY_ROOT / "examples" / "experience-bench-s" / "pilot-manifest.json"
+)
+EXPECTED_CASE_IDS = (
+    "recurring-zh-cache-check",
+    "recurring-zh-migration-lock",
+    "recurring-en-test-scope",
+    "recurring-en-release-evidence",
+    "recurring-mix-queue-retry",
+    "recurring-mix-owner-query",
+    "environment-zh-python-version",
+    "environment-zh-sqlite-wal",
+    "environment-en-macos-path",
+    "environment-en-fts5-capability",
+    "environment-mix-uv-lock",
+    "environment-mix-timezone",
+    "state-change-zh-endpoint-version",
+    "state-change-zh-schema-revision",
+    "state-change-en-branch-head",
+    "state-change-en-provider-capability",
+    "state-change-mix-token-format",
+    "state-change-mix-feature-flag",
+    "recovery-zh-stale-cache",
+    "recovery-zh-failed-migration",
+    "recovery-en-lock-timeout",
+    "recovery-en-partial-artifact",
+    "recovery-mix-csrf-refresh",
+    "recovery-mix-worker-replay",
+    "distractor-zh-similar-project",
+    "distractor-zh-foreign-owner",
+    "distractor-en-old-command",
+    "distractor-en-pending-candidate",
+    "distractor-mix-keyword-collision",
+    "distractor-mix-archived-note",
+)
+EXPECTED_DIFFICULTIES = (
+    "I",
+    "A",
+    "B",
+    "A",
+    "I",
+    "I",
+    "B",
+    "A",
+    "I",
+    "I",
+    "B",
+    "B",
+    "B",
+    "A",
+    "I",
+    "I",
+    "B",
+    "I",
+    "B",
+    "A",
+    "I",
+    "I",
+    "I",
+    "A",
+    "B",
+    "B",
+    "B",
+    "I",
+    "A",
+    "I",
+)
+REVIEWED_ABSTRACTIONS = frozenset(
+    {
+        "recurring-zh-cache-check",
+        "recurring-en-release-evidence",
+        "environment-zh-sqlite-wal",
+        "environment-mix-uv-lock",
+        "state-change-en-branch-head",
+        "state-change-mix-feature-flag",
+        "recovery-zh-stale-cache",
+        "recovery-en-partial-artifact",
+        "distractor-en-old-command",
+        "distractor-mix-keyword-collision",
+    }
+)
 
 
 def _jsonl(records: list[dict[str, object]]) -> bytes:
@@ -381,3 +465,147 @@ def test_rejects_data_file_swapped_for_symlink_at_open_without_reading_target(
     _assert_rejected(manifest_path, "benchmark_invalid_pack")
 
     assert target_body not in hashed_bodies
+
+
+def test_committed_pilot_pack_has_exact_reviewed_composition_and_privacy() -> None:
+    loaded = load_benchmark_pack(PILOT_MANIFEST)
+    cases = loaded.cases
+    manifest = loaded.manifest
+
+    assert tuple(case.case_id for case in cases) == EXPECTED_CASE_IDS
+    assert tuple(case.difficulty for case in cases) == EXPECTED_DIFFICULTIES
+    assert tuple(case.stratum.value for case in cases) == (
+        ("recurring_workflow",) * 6
+        + ("environment_gotcha",) * 6
+        + ("state_change",) * 6
+        + ("failure_recovery",) * 6
+        + ("irrelevant_distractor",) * 6
+    )
+    assert tuple(case.language.value for case in cases) == (
+        "zh",
+        "zh",
+        "en",
+        "en",
+        "mixed",
+        "mixed",
+    ) * 5
+    assert {
+        case.case_id
+        for case in cases
+        if case.source_class.value == "reviewed_abstraction"
+    } == REVIEWED_ABSTRACTIONS
+    assert all(
+        case.review_status
+        == (
+            "maintainer_reviewed"
+            if case.case_id in REVIEWED_ABSTRACTIONS
+            else "authored"
+        )
+        for case in cases
+    )
+    assert len({case.owner_label for case in cases}) == 30
+    assert Counter(case.language.value for case in cases) == {
+        "zh": 10,
+        "en": 10,
+        "mixed": 10,
+    }
+    assert Counter(case.stratum.value for case in cases) == {
+        "recurring_workflow": 6,
+        "environment_gotcha": 6,
+        "state_change": 6,
+        "failure_recovery": 6,
+        "irrelevant_distractor": 6,
+    }
+
+    arm_registry = tuple(
+        (arm.arm_id, arm.kind.value, arm.required) for arm in manifest.arms
+    )
+    assert arm_registry == (
+        ("no_memory", "no_memory", True),
+        ("recent_notes", "recent_notes", True),
+        ("sqlite_bm25", "sqlite_bm25", True),
+        ("experience_hub", "experience_hub", True),
+    )
+    assert manifest.deterministic_replay_runs == 2
+    assert (
+        manifest.schema_version,
+        manifest.oracle_version,
+        manifest.metric_version,
+        manifest.gate_version,
+        manifest.evidence_schema_version,
+        manifest.summary_schema_version,
+        manifest.profile_schema_version,
+    ) == (1, 1, 1, 1, 1, 1, 1)
+    assert sha256_hex(loaded.cases_body) == manifest.cases.sha256
+    assert sha256_hex(loaded.source_body) == manifest.source.sha256
+    manifest_document = json.loads(loaded.manifest_body)
+    assert canonical_json_bytes(manifest_document) == loaded.manifest_body
+    assert all(
+        canonical_json_bytes(json.loads(line)) == line
+        for body in (loaded.cases_body, loaded.source_body)
+        for line in body.rstrip(b"\n").splitlines()
+    )
+
+    source_by_label = {record.label: record for record in loaded.source}
+    case_by_id = {case.case_id: case for case in cases}
+    seen_case_labels: set[str] = set()
+    for case in cases:
+        groups = (
+            case.required,
+            case.optional,
+            case.forbidden,
+            case.stale,
+            case.misleading,
+        )
+        semantic_labels = {item.label for group in groups for item in group}
+        assert set(case.source_labels) == semantic_labels
+        assert not (seen_case_labels & semantic_labels)
+        assert all(label.startswith(f"{case.case_id}-") for label in semantic_labels)
+        assert all(label in source_by_label for label in semantic_labels)
+        assert all(
+            source_by_label[label].owner_label == case.owner_label
+            for label in semantic_labels
+            if label != "distractor-zh-foreign-owner-misleading-2"
+        )
+        seen_case_labels.update(semantic_labels)
+        assert sum(item.weight_micros for item in case.required) == 450_000
+        assert sum(
+            item.weight_micros
+            for group in (case.forbidden, case.stale, case.misleading)
+            for item in group
+        ) == 300_000
+        assert sum(item.weight_micros for item in case.checkpoints) == 150_000
+        predicates = {item.predicate.value for item in case.checkpoints}
+        assert predicates == (
+            {"ordered_subsequence"}
+            if case.stratum.value == "failure_recovery"
+            else {"required_set"}
+        )
+
+    foreign_case = case_by_id["distractor-zh-foreign-owner"]
+    foreign = source_by_label["distractor-zh-foreign-owner-misleading-2"]
+    assert foreign.owner_label != foreign_case.owner_label
+    assert foreign.owner_label == "distractor-zh-foreign-owner-foreign-owner"
+
+    pending_case = case_by_id["distractor-en-pending-candidate"]
+    pending = source_by_label["distractor-en-pending-candidate-misleading-2"]
+    assert pending.record_type == "candidate"
+    assert pending.owner_label == pending_case.owner_label
+    assert pending.label not in pending_case.source_labels
+
+    archived_case = case_by_id["distractor-mix-archived-note"]
+    archived = source_by_label["distractor-mix-archived-note-stale-2"]
+    assert archived.owner_label == archived_case.owner_label
+    assert archived.temperature.value == "archived"
+
+    public_bodies = (
+        loaded.manifest_body,
+        loaded.cases_body,
+        loaded.source_body,
+        (PILOT_MANIFEST.parent / "README.md").read_bytes(),
+    )
+    for body in public_bodies:
+        assert b"/Users/" not in body
+        assert b"C:\\Users\\" not in body
+        assert b"@" not in body
+        assert b"-----BEGIN " not in body
