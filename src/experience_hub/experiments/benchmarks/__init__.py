@@ -30,6 +30,7 @@ from experience_hub.experiments.benchmarks.contracts import (
     BenchmarkPassPayloadV1,
     BenchmarkProfileDataV1,
     BenchmarkProfileReportV1,
+    BenchmarkSafetyEvidenceV1,
     BenchmarkSourceAgentV1,
     BenchmarkSourceCandidateV1,
     BenchmarkSourceClass,
@@ -41,6 +42,13 @@ from experience_hub.experiments.benchmarks.contracts import (
     BenchmarkSummaryReportV1,
     BenchmarkWeightedLabelV1,
     ResolvedBenchmarkManifestV1,
+)
+from experience_hub.experiments.benchmarks.runner import (
+    BenchmarkExecution,
+    BenchmarkInspection,
+    inspect_benchmark_pack,
+    run_benchmark_pilot,
+    verify_benchmark_report,
 )
 
 __all__ = [
@@ -65,14 +73,17 @@ __all__ = [
     "BenchmarkDeltaAggregateV1",
     "BenchmarkEvidenceDataV1",
     "BenchmarkEvidenceReportV1",
+    "BenchmarkExecution",
     "BenchmarkFileDescriptorV1",
     "BenchmarkGateResultV1",
     "BenchmarkLanguage",
+    "BenchmarkInspection",
     "BenchmarkOracleEvidenceV1",
     "BenchmarkPackManifestV1",
     "BenchmarkPassPayloadV1",
     "BenchmarkProfileDataV1",
     "BenchmarkProfileReportV1",
+    "BenchmarkSafetyEvidenceV1",
     "BenchmarkSourceAgentV1",
     "BenchmarkSourceCandidateV1",
     "BenchmarkSourceClass",
@@ -84,4 +95,7 @@ __all__ = [
     "BenchmarkSummaryReportV1",
     "BenchmarkWeightedLabelV1",
     "ResolvedBenchmarkManifestV1",
+    "inspect_benchmark_pack",
+    "run_benchmark_pilot",
+    "verify_benchmark_report",
 ]
