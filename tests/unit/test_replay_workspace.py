@@ -681,6 +681,7 @@ def test_group_publication_never_replaces_a_racing_empty_artifacts_directory(
     )
     existing = getattr(workspace_module, "_rename_directory_noreplace", None)
     injected = workspace.root / "artifacts"
+    injected_identity: tuple[int, int] | None = None
 
     def create_racing_destination(
         source: str,
@@ -688,8 +689,10 @@ def test_group_publication_never_replaces_a_racing_empty_artifacts_directory(
         destination: str,
         destination_directory_fd: int,
     ) -> None:
+        nonlocal injected_identity
         injected.mkdir()
-        (injected / "racing-sentinel").write_bytes(b"leave-this-directory")
+        status = injected.stat(follow_symlinks=False)
+        injected_identity = (status.st_dev, status.st_ino)
         if existing is None:
             raise AssertionError("atomic no-replace wrapper was not implemented")
         existing(
@@ -709,7 +712,10 @@ def test_group_publication_never_replaces_a_racing_empty_artifacts_directory(
         workspace.atomic_write_group(_benchmark_artifact_bodies())
 
     assert captured.value.code == "replay_workspace_write_failed"
-    assert (injected / "racing-sentinel").read_bytes() == b"leave-this-directory"
+    assert injected_identity is not None
+    current = injected.stat(follow_symlinks=False)
+    assert (current.st_dev, current.st_ino) == injected_identity
+    assert tuple(injected.iterdir()) == ()
     staging = workspace.root / "validation"
     assert not staging.exists() or not tuple(staging.iterdir())
 
