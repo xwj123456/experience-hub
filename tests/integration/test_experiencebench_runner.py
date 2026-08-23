@@ -31,6 +31,7 @@ from experience_hub.experiments.benchmarks.runner import (
 )
 from experience_hub.experiments.benchmarks.source import build_benchmark_source
 from experience_hub.experiments.errors import (
+    ExperimentInputError,
     ExperimentIsolationError,
 )
 from experience_hub.experiments.reports import ExperimentOutputError
@@ -477,6 +478,160 @@ async def test_clone_normalization_never_writes_through_a_racing_public_path(
     assert arm.status == "failed"
     assert arm.error_code == "benchmark_safety_failure"
     assert arm.error_stage == "clone"
+
+
+@pytest.mark.asyncio
+async def test_clone_normalization_rejects_same_inode_mutation_after_final_hash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest_path = _write_pack(tmp_path / "pack")
+    _, workspace, built_value = await _built_source(
+        manifest_path, tmp_path / "workspace"
+    )
+    built = cast(runner_module.BuiltBenchmarkSource, built_value)
+    clone_path = workspace.root / "race" / "clone.sqlite3"
+    clone = runner_module.clone_frozen_sqlite(built.snapshot, clone_path)
+    clone_status = clone.stat()
+    clone_identity = (clone_status.st_dev, clone_status.st_ino)
+    original_read = runner_module.os.read
+    original_pwrite = runner_module.os.pwrite
+    mutated = False
+
+    def mutating_read(descriptor: int, count: int) -> bytes:
+        nonlocal mutated
+        chunk = original_read(descriptor, count)
+        status = runner_module.os.fstat(descriptor)
+        if (
+            not mutated
+            and chunk
+            and (status.st_dev, status.st_ino) == clone_identity
+            and runner_module.os.pread(descriptor, 2, 18) == b"\x01\x01"
+            and runner_module.os.lseek(descriptor, 0, runner_module.os.SEEK_CUR)
+            == clone_status.st_size
+        ):
+            mutated = True
+            final_offset = clone_status.st_size - 1
+            current = runner_module.os.pread(descriptor, 1, final_offset)
+            assert len(current) == 1
+            assert original_pwrite(
+                descriptor,
+                bytes((current[0] ^ 1,)),
+                final_offset,
+            ) == 1
+            runner_module.os.fsync(descriptor)
+            runner_module.os.utime(
+                descriptor,
+                ns=(status.st_atime_ns, status.st_mtime_ns + 1_000_000_000),
+            )
+        return chunk
+
+    monkeypatch.setattr(runner_module.os, "read", mutating_read)
+
+    with pytest.raises(ExperimentInputError) as raised:
+        runner_module._prepare_clone_for_descriptor_policy(
+            clone,
+            expected_identity=clone_identity,
+            expected_size=clone_status.st_size,
+            expected_sha256=built.snapshot.database_sha256,
+        )
+
+    assert raised.value.code == "benchmark_safety_failure"
+    assert mutated is True
+    final_status = clone.stat()
+    assert (final_status.st_dev, final_status.st_ino) == clone_identity
+    assert final_status.st_size == clone_status.st_size
+    normalized = bytearray(built.snapshot.database_bytes)
+    normalized[18:20] = b"\x01\x01"
+    assert clone.read_bytes() != bytes(normalized)
+
+
+@pytest.mark.asyncio
+async def test_clone_normalization_pwrite_retains_clone_authority_during_path_swap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest_path = _write_pack(tmp_path / "pack")
+    _, workspace, built_value = await _built_source(
+        manifest_path, tmp_path / "workspace"
+    )
+    built = cast(runner_module.BuiltBenchmarkSource, built_value)
+    clone_path = workspace.root / "race" / "clone.sqlite3"
+    clone = runner_module.clone_frozen_sqlite(built.snapshot, clone_path)
+    clone_status = clone.stat()
+    clone_identity = (clone_status.st_dev, clone_status.st_ino)
+    parked_path = clone.with_name("parked.sqlite3")
+    source_status = built.path.stat()
+    source_before = (
+        built.path.read_bytes(),
+        built.path.read_bytes()[18:20],
+        (source_status.st_dev, source_status.st_ino),
+        tuple(
+            (
+                suffix,
+                candidate.read_bytes() if candidate.is_file() else None,
+            )
+            for suffix in ("-wal", "-shm", "-journal")
+            if (candidate := Path(f"{built.path}{suffix}")).exists()
+        ),
+    )
+    original_pwrite = runner_module.os.pwrite
+    pwrite_raced = False
+    retained_header: bytes | None = None
+
+    def racing_pwrite(descriptor: int, data: bytes, offset: int) -> int:
+        nonlocal pwrite_raced, retained_header
+        status = runner_module.os.fstat(descriptor)
+        if (
+            pwrite_raced
+            or (status.st_dev, status.st_ino) != clone_identity
+            or data != b"\x01\x01"
+            or offset != 18
+        ):
+            return original_pwrite(descriptor, data, offset)
+        pwrite_raced = True
+        clone.replace(parked_path)
+        clone.symlink_to(built.path)
+        written = original_pwrite(descriptor, data, offset)
+        retained_header = runner_module.os.pread(descriptor, 2, 18)
+        return written
+
+    monkeypatch.setattr(runner_module.os, "pwrite", racing_pwrite)
+
+    try:
+        with pytest.raises(ExperimentInputError) as raised:
+            runner_module._prepare_clone_for_descriptor_policy(
+                clone,
+                expected_identity=clone_identity,
+                expected_size=clone_status.st_size,
+                expected_sha256=built.snapshot.database_sha256,
+            )
+
+        assert raised.value.code == "benchmark_safety_failure"
+        assert pwrite_raced is True
+        assert retained_header == b"\x01\x01"
+        assert parked_path.read_bytes()[18:20] == b"\x01\x01"
+        assert clone.is_symlink()
+        final_source_status = built.path.stat()
+        assert (
+            built.path.read_bytes(),
+            built.path.read_bytes()[18:20],
+            (final_source_status.st_dev, final_source_status.st_ino),
+            tuple(
+                (
+                    suffix,
+                    candidate.read_bytes() if candidate.is_file() else None,
+                )
+                for suffix in ("-wal", "-shm", "-journal")
+                if (candidate := Path(f"{built.path}{suffix}")).exists()
+            ),
+        ) == source_before
+        verify_source_unchanged(built.snapshot)
+    finally:
+        if clone.is_symlink():
+            clone.unlink()
+        if parked_path.exists():
+            parked_path.replace(clone)
 
 
 class _ObservationPolicy:

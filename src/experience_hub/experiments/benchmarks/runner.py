@@ -397,6 +397,15 @@ def _prepare_clone_for_descriptor_policy(
         if os.pwrite(descriptor, b"\x01\x01", 18) != 2:
             raise OSError
         os.fsync(descriptor)
+        verification_started = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(verification_started.st_mode)
+            or verification_started.st_nlink != 1
+            or verification_started.st_size != expected_size
+            or (verification_started.st_dev, verification_started.st_ino)
+            != expected_identity
+        ):
+            raise OSError
         final_digest = hashlib.sha256()
         os.lseek(descriptor, 0, os.SEEK_SET)
         remaining = expected_size
@@ -406,7 +415,7 @@ def _prepare_clone_for_descriptor_policy(
                 raise OSError
             final_digest.update(chunk)
             remaining -= len(chunk)
-        final_descriptor = os.fstat(descriptor)
+        verification_finished = os.fstat(descriptor)
         final = path.lstat()
         sidecar_present = False
         for suffix in ("-wal", "-shm", "-journal"):
@@ -416,17 +425,22 @@ def _prepare_clone_for_descriptor_policy(
                 continue
             sidecar_present = True
         if (
-            os.pread(descriptor, 2, 18) != b"\x01\x01"
-            or final_digest.hexdigest() != normalized_digest.hexdigest()
-            or not stat.S_ISREG(final_descriptor.st_mode)
-            or final_descriptor.st_nlink != 1
-            or final_descriptor.st_size != expected_size
-            or (final_descriptor.st_dev, final_descriptor.st_ino)
-            != expected_identity
+            final_digest.hexdigest() != normalized_digest.hexdigest()
+            or verification_finished.st_dev != verification_started.st_dev
+            or verification_finished.st_ino != verification_started.st_ino
+            or verification_finished.st_size != verification_started.st_size
+            or verification_finished.st_nlink != verification_started.st_nlink
+            or verification_finished.st_mtime_ns
+            != verification_started.st_mtime_ns
+            or verification_finished.st_ctime_ns
+            != verification_started.st_ctime_ns
             or not stat.S_ISREG(final.st_mode)
-            or final.st_nlink != 1
-            or final.st_size != expected_size
-            or (final.st_dev, final.st_ino) != expected_identity
+            or final.st_dev != verification_finished.st_dev
+            or final.st_ino != verification_finished.st_ino
+            or final.st_size != verification_finished.st_size
+            or final.st_nlink != verification_finished.st_nlink
+            or final.st_mtime_ns != verification_finished.st_mtime_ns
+            or final.st_ctime_ns != verification_finished.st_ctime_ns
             or sidecar_present
         ):
             raise OSError
