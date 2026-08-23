@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import cast
@@ -365,6 +366,119 @@ async def test_private_pass_seam_uses_two_cases_four_arms_and_fresh_clones(
     verify_source_unchanged(built.snapshot)
 
 
+@pytest.mark.asyncio
+async def test_clone_normalization_never_writes_through_a_racing_public_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest_path = _write_pack(tmp_path / "pack")
+    pack_value, workspace, built_value = await _built_source(
+        manifest_path, tmp_path / "workspace"
+    )
+    pack = cast(runner_module.LoadedBenchmarkPack, pack_value)
+    built = cast(runner_module.BuiltBenchmarkSource, built_value)
+    clone_path = (
+        workspace.root / "arms" / "pass-a" / "case-1" / "no_memory.sqlite3"
+    )
+    parked_path = clone_path.with_name("parked.sqlite3")
+    source_status = built.path.stat()
+    source_before = (
+        built.path.read_bytes(),
+        built.path.read_bytes()[18:20],
+        (source_status.st_dev, source_status.st_ino),
+        tuple(
+            (
+                suffix,
+                candidate.read_bytes() if candidate.is_file() else None,
+            )
+            for suffix in ("-wal", "-shm", "-journal")
+            if (candidate := Path(f"{built.path}{suffix}")).exists()
+        ),
+    )
+    original_connect = sqlite3.connect
+    original_open = runner_module.os.open
+    sqlite_raced = False
+    descriptor_raced = False
+
+    def install_racing_symlink() -> None:
+        clone_path.replace(parked_path)
+        clone_path.symlink_to(built.path)
+
+    def restore_clone_path() -> None:
+        clone_path.unlink()
+        parked_path.replace(clone_path)
+
+    def racing_connect(database: object, *args: object, **kwargs: object) -> object:
+        nonlocal sqlite_raced
+        if Path(cast(str | Path, database)) != clone_path:
+            return original_connect(database, *args, **kwargs)
+        sqlite_raced = True
+        install_racing_symlink()
+        try:
+            connection = original_connect(database, *args, **kwargs)
+        finally:
+            restore_clone_path()
+        return connection
+
+    def racing_open(
+        path: object,
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal descriptor_raced
+        if (
+            dir_fd is not None
+            or Path(cast(str | Path, path)) != clone_path
+            or flags & runner_module.os.O_ACCMODE != runner_module.os.O_RDWR
+        ):
+            return original_open(path, flags, mode, dir_fd=dir_fd)
+        descriptor_raced = True
+        install_racing_symlink()
+        try:
+            return original_open(path, flags, mode)
+        finally:
+            restore_clone_path()
+
+    monkeypatch.setattr(sqlite3, "connect", racing_connect)
+    monkeypatch.setattr(runner_module.os, "open", racing_open)
+
+    result = await runner_module._execute_benchmark_cases(
+        pass_name="pass-a",
+        cases=pack.cases[:1],
+        descriptors=pack.manifest.arms,
+        workspace=workspace,
+        source=built,
+        source_records=pack.source,
+        seen_identities=set(),
+        frozen_at=pack.manifest.frozen_at,
+        seed=pack.manifest.seed,
+    )
+
+    final_status = built.path.stat()
+    assert (
+        built.path.read_bytes(),
+        built.path.read_bytes()[18:20],
+        (final_status.st_dev, final_status.st_ino),
+        tuple(
+            (
+                suffix,
+                candidate.read_bytes() if candidate.is_file() else None,
+            )
+            for suffix in ("-wal", "-shm", "-journal")
+            if (candidate := Path(f"{built.path}{suffix}")).exists()
+        ),
+    ) == source_before
+    verify_source_unchanged(built.snapshot)
+    assert sqlite_raced is False
+    assert descriptor_raced is True
+    arm = result.cases[0].arms[0]
+    assert arm.status == "failed"
+    assert arm.error_code == "benchmark_safety_failure"
+    assert arm.error_stage == "clone"
+
+
 class _ObservationPolicy:
     def __init__(self, returned_labels: tuple[str, ...]) -> None:
         self._returned_labels = returned_labels
@@ -604,7 +718,9 @@ async def test_full_runner_publishes_two_real_thirty_case_four_arm_passes(
     manifest_path = _write_pack(pack_root)
     pack_before = _tree_bytes(pack_root)
     recorded_clones: list[tuple[Path, str, tuple[int, int]]] = []
+    policy_calls: list[tuple[str, str, str, Path, tuple[int, int]]] = []
     original_clone = runner_module.clone_frozen_sqlite
+    original_build_policy = runner_module.build_benchmark_policy
 
     def recording_clone(snapshot: object, destination: Path) -> Path:
         clone = original_clone(
@@ -618,6 +734,36 @@ async def test_full_runner_publishes_two_real_thirty_case_four_arm_passes(
         return clone
 
     monkeypatch.setattr(runner_module, "clone_frozen_sqlite", recording_clone)
+
+    def recording_build_policy(
+        descriptor: runner_module.BenchmarkArmDescriptorV1,
+    ) -> object:
+        policy = original_build_policy(descriptor)
+
+        class RecordingPolicy:
+            async def execute(
+                self,
+                context: runner_module.BenchmarkPolicyContext,
+            ) -> BenchmarkArmObservationV1:
+                status = context.clone_path.stat()
+                policy_calls.append(
+                    (
+                        context.clone_path.parts[-3],
+                        context.case.case_id,
+                        descriptor.arm_id,
+                        context.clone_path,
+                        (status.st_dev, status.st_ino),
+                    )
+                )
+                return await policy.execute(context)
+
+        return RecordingPolicy()
+
+    monkeypatch.setattr(
+        runner_module,
+        "build_benchmark_policy",
+        recording_build_policy,
+    )
     clock = iter((100, 175))
     workspace = tmp_path / "pilot"
 
@@ -677,6 +823,35 @@ async def test_full_runner_publishes_two_real_thirty_case_four_arm_passes(
         execution.evidence.data.pass_payload.resolved_manifest.snapshot_sha256
     }
     assert len({identity for _, _, identity in recorded_clones}) == 240
+    clone_identities = {path: identity for path, _, identity in recorded_clones}
+    manifest_arm_ids = tuple(
+        descriptor.arm_id
+        for descriptor in load_benchmark_pack(manifest_path).manifest.arms
+    )
+    assert policy_calls == [
+        (
+            pass_name,
+            f"case-{case}",
+            arm_id,
+            workspace
+            / "arms"
+            / pass_name
+            / f"case-{case}"
+            / f"{arm_id}.sqlite3",
+            clone_identities[
+                workspace
+                / "arms"
+                / pass_name
+                / f"case-{case}"
+                / f"{arm_id}.sqlite3"
+            ],
+        )
+        for pass_name in ("pass-a", "pass-b")
+        for case in range(1, 31)
+        for arm_id in manifest_arm_ids
+    ]
+    assert len({path for _, _, _, path, _ in policy_calls}) == 240
+    assert len({identity for _, _, _, _, identity in policy_calls}) == 240
     source_path = workspace / "snapshot" / "source.sqlite3"
     assert source_path.read_bytes()[18:20] == b"\x02\x02"
     source_status = source_path.stat()
@@ -752,10 +927,9 @@ async def test_pass_mismatch_and_profiler_failure_remain_separate_truthful_state
     assert execution.deterministic_replay_match is False
     assert execution.evidence_valid is False
     assert execution.profile_complete is False
-    assert execution.profile is not None
-    assert execution.profile.data.wall_duration_ns is None
-    assert execution.profile_body is not None
-    assert b"machine-local" not in execution.profile_body
+    assert execution.profile is None
+    assert execution.profile_body is None
+    assert not (tmp_path / "pilot" / "artifacts" / "profile.json").exists()
 
 
 @pytest.mark.asyncio
@@ -791,8 +965,133 @@ async def test_profiler_failure_does_not_invalidate_complete_evidence(
     assert execution.comparison_complete is True
     assert execution.deterministic_replay_match is True
     assert execution.profile_complete is False
-    assert execution.profile is not None
-    assert execution.profile.data.profile_complete is False
+    assert execution.profile is None
+    assert execution.profile_body is None
+    assert not (tmp_path / "pilot" / "artifacts" / "profile.json").exists()
+
+
+class _ProfilerArithmeticBomb(int):
+    def __sub__(self, other: object) -> int:
+        del other
+        raise AssertionError("profiler arithmetic must not run")
+
+    def __str__(self) -> str:
+        raise AssertionError("profiler string conversion must not run")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "profiler_values",
+    (
+        (False,),
+        ("not-an-int",),
+        (-1,),
+        (1, 0),
+        (1 << 1_000_000,),
+        (0, 1 << 1_000_000),
+        (_ProfilerArithmeticBomb(0), _ProfilerArithmeticBomb(1)),
+    ),
+    ids=(
+        "bool",
+        "string",
+        "negative",
+        "backward",
+        "huge-start",
+        "huge-end",
+        "int-subclass",
+    ),
+)
+async def test_invalid_profiler_values_omit_profile_without_affecting_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    profiler_values: tuple[object, ...],
+) -> None:
+    manifest_path = _write_pack(tmp_path / "pack")
+    pack = load_benchmark_pack(manifest_path)
+    results = iter(
+        (
+            _pass_result(pack, identity_offset=0),
+            _pass_result(pack, identity_offset=120),
+        )
+    )
+
+    async def execute_cases(**kwargs: object) -> runner_module._PassResult:
+        del kwargs
+        return next(results)
+
+    profiler_results = iter(profiler_values)
+    monkeypatch.setattr(runner_module, "_execute_benchmark_cases", execute_cases)
+
+    execution = await run_benchmark_pilot(
+        manifest_path,
+        tmp_path / "pilot",
+        profiler=profiler_results.__next__,
+    )
+
+    assert execution.evidence_valid is True
+    assert execution.comparison_complete is True
+    assert execution.deterministic_replay_match is True
+    assert execution.profile_complete is False
+    assert execution.profile is None
+    assert execution.profile_body is None
+    artifacts = tmp_path / "pilot" / "artifacts"
+    assert (artifacts / "benchmark-evidence.json").is_file()
+    assert (artifacts / "benchmark-summary.json").is_file()
+    assert not (artifacts / "profile.json").exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_stage", ("construct", "encode"))
+async def test_profile_construction_and_encoding_failures_remain_optional(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_stage: str,
+) -> None:
+    manifest_path = _write_pack(tmp_path / "pack")
+    pack = load_benchmark_pack(manifest_path)
+    results = iter(
+        (
+            _pass_result(pack, identity_offset=0),
+            _pass_result(pack, identity_offset=120),
+        )
+    )
+
+    async def execute_cases(**kwargs: object) -> runner_module._PassResult:
+        del kwargs
+        return next(results)
+
+    def fail_profile(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        raise ValueError("profile-local failure")
+
+    monkeypatch.setattr(runner_module, "_execute_benchmark_cases", execute_cases)
+    target = (
+        "_profile"
+        if failure_stage == "construct"
+        else "canonical_benchmark_profile_bytes"
+    )
+    monkeypatch.setattr(
+        runner_module,
+        target,
+        fail_profile,
+    )
+    clock = iter((100, 175))
+
+    execution = await run_benchmark_pilot(
+        manifest_path,
+        tmp_path / "pilot",
+        profiler=clock.__next__,
+    )
+
+    assert execution.evidence_valid is True
+    assert execution.deterministic_replay_match is True
+    assert execution.profile_complete is False
+    assert execution.profile is None
+    assert execution.profile_body is None
+    artifacts = tmp_path / "pilot" / "artifacts"
+    assert (artifacts / "benchmark-evidence.json").is_file()
+    assert (artifacts / "benchmark-summary.json").is_file()
+    assert not (artifacts / "profile.json").exists()
 
 
 @pytest.mark.asyncio

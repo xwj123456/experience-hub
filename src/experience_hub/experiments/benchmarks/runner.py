@@ -6,10 +6,9 @@ import asyncio
 import hashlib
 import os
 import re
-import sqlite3
 import stat
 from collections.abc import Callable, Sequence
-from contextlib import closing, suppress
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -88,6 +87,7 @@ _SCHEMA_REVISION = re.compile(r"0*(\d+)(?:_[a-z0-9_]+)?\Z")
 _REPORT_NAME = "benchmark-evidence.json"
 _SUMMARY_NAME = "benchmark-summary.json"
 _PROFILE_NAME = "profile.json"
+_MAX_PROFILE_CLOCK_NS = (1 << 63) - 1
 _DIRECTORY_FLAGS = (
     os.O_RDONLY
     | getattr(os, "O_CLOEXEC", 0)
@@ -345,41 +345,100 @@ def _prepare_clone_for_descriptor_policy(
     path: Path,
     *,
     expected_identity: tuple[int, int],
+    expected_size: int,
+    expected_sha256: str,
 ) -> None:
-    """Move only a disposable clone out of WAL mode for descriptor-bound SQLite."""
+    """Normalize only the identity-bound clone through one retained descriptor."""
+    descriptor = -1
     try:
         retained = path.lstat()
         if (
             not stat.S_ISREG(retained.st_mode)
             or retained.st_nlink != 1
+            or retained.st_size != expected_size
             or (retained.st_dev, retained.st_ino) != expected_identity
         ):
             raise OSError
-        with closing(
-            sqlite3.connect(path, isolation_level=None, timeout=5)
-        ) as connection, connection:
-            row = connection.execute("PRAGMA journal_mode = DELETE").fetchone()
+        descriptor = os.open(
+            path,
+            os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or opened.st_size != expected_size
+            or (opened.st_dev, opened.st_ino) != expected_identity
+        ):
+            raise OSError
+
+        original_digest = hashlib.sha256()
+        normalized_digest = hashlib.sha256()
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        offset = 0
+        while offset < expected_size:
+            chunk = os.read(descriptor, min(expected_size - offset, 1024 * 1024))
+            if not chunk:
+                raise OSError
+            original_digest.update(chunk)
+            normalized_chunk = bytearray(chunk)
+            for header_offset in (18, 19):
+                relative = header_offset - offset
+                if 0 <= relative < len(normalized_chunk):
+                    normalized_chunk[relative] = 1
+            normalized_digest.update(normalized_chunk)
+            offset += len(chunk)
+        if (
+            original_digest.hexdigest() != expected_sha256
+            or os.pread(descriptor, 2, 18) not in {b"\x01\x01", b"\x02\x02"}
+        ):
+            raise OSError
+
+        if os.pwrite(descriptor, b"\x01\x01", 18) != 2:
+            raise OSError
+        os.fsync(descriptor)
+        final_digest = hashlib.sha256()
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        remaining = expected_size
+        while remaining:
+            chunk = os.read(descriptor, min(remaining, 1024 * 1024))
+            if not chunk:
+                raise OSError
+            final_digest.update(chunk)
+            remaining -= len(chunk)
+        final_descriptor = os.fstat(descriptor)
         final = path.lstat()
         sidecar_present = False
-        for suffix in ("-wal", "-shm"):
+        for suffix in ("-wal", "-shm", "-journal"):
             try:
                 Path(f"{path}{suffix}").lstat()
             except FileNotFoundError:
                 continue
             sidecar_present = True
         if (
-            row != ("delete",)
+            os.pread(descriptor, 2, 18) != b"\x01\x01"
+            or final_digest.hexdigest() != normalized_digest.hexdigest()
+            or not stat.S_ISREG(final_descriptor.st_mode)
+            or final_descriptor.st_nlink != 1
+            or final_descriptor.st_size != expected_size
+            or (final_descriptor.st_dev, final_descriptor.st_ino)
+            != expected_identity
             or not stat.S_ISREG(final.st_mode)
             or final.st_nlink != 1
+            or final.st_size != expected_size
             or (final.st_dev, final.st_ino) != expected_identity
             or sidecar_present
         ):
             raise OSError
-    except (OSError, sqlite3.Error):
+    except OSError:
         raise ExperimentInputError(
             "benchmark_safety_failure",
             "Benchmark clone could not be prepared",
         ) from None
+    finally:
+        if descriptor >= 0:
+            with suppress(OSError):
+                os.close(descriptor)
 
 
 async def _execute_benchmark_cases(
@@ -457,6 +516,8 @@ async def _execute_benchmark_cases(
                     _prepare_clone_for_descriptor_policy,
                     clone,
                     expected_identity=identity,
+                    expected_size=len(source.snapshot.database_bytes),
+                    expected_sha256=source.snapshot.database_sha256,
                 )
             except asyncio.CancelledError:
                 raise
@@ -671,6 +732,16 @@ def _profile(
     )
 
 
+def _bounded_profiler_value(profiler: Callable[[], int]) -> int | None:
+    try:
+        value = profiler()
+    except Exception:
+        return None
+    if type(value) is not int or not 0 <= value <= _MAX_PROFILE_CLOCK_NS:
+        return None
+    return value
+
+
 def _workspace_overlap() -> ExperimentIsolationError:
     return ExperimentIsolationError(
         "benchmark_workspace_input_overlap",
@@ -801,15 +872,8 @@ async def run_benchmark_pilot(
         source_schema_revision=_schema_revision_number(revision),
     )
 
-    profile_complete = True
-    started_ns: int | None
-    try:
-        started_ns = profiler()
-        if isinstance(started_ns, bool) or not isinstance(started_ns, int):
-            raise TypeError
-    except Exception:
-        started_ns = None
-        profile_complete = False
+    started_ns = _bounded_profiler_value(profiler)
+    profile_complete = started_ns is not None
 
     seen_identities: set[tuple[int, int]] = set()
     first = await _execute_benchmark_cases(
@@ -837,15 +901,10 @@ async def run_benchmark_pilot(
 
     duration_ns: int | None = None
     if started_ns is not None:
-        try:
-            finished_ns = profiler()
-            if isinstance(finished_ns, bool) or not isinstance(finished_ns, int):
-                raise TypeError
+        finished_ns = _bounded_profiler_value(profiler)
+        if finished_ns is not None and finished_ns >= started_ns:
             duration_ns = finished_ns - started_ns
-            if duration_ns < 0:
-                raise ValueError
-        except Exception:
-            duration_ns = None
+        else:
             profile_complete = False
 
     source_unchanged = True
@@ -873,13 +932,21 @@ async def run_benchmark_pilot(
         first_payload,
         deterministic_replay_match=deterministic_match,
     )
-    profile: BenchmarkProfileReportV1 | None = _profile(
-        pack_id=pack.manifest.pack_id,
-        complete=profile_complete,
-        duration_ns=duration_ns,
-        database_bytes=len(source.snapshot.database_bytes),
-        clone_count=len((*first.clone_identities, *second.clone_identities)),
-    )
+    profile: BenchmarkProfileReportV1 | None = None
+    if profile_complete and duration_ns is not None:
+        try:
+            candidate_profile = _profile(
+                pack_id=pack.manifest.pack_id,
+                complete=True,
+                duration_ns=duration_ns,
+                database_bytes=len(source.snapshot.database_bytes),
+                clone_count=len((*first.clone_identities, *second.clone_identities)),
+            )
+            canonical_benchmark_profile_bytes(candidate_profile)
+        except Exception:
+            profile_complete = False
+        else:
+            profile = candidate_profile
 
     try:
         artifacts = await _complete_threaded(
@@ -889,7 +956,10 @@ async def run_benchmark_pilot(
             profile=profile,
         )
     except ExperimentOutputError as error:
-        if error.code != "invalid_benchmark_profile":
+        if profile is None or error.code not in {
+            "invalid_benchmark_profile",
+            "output_too_large",
+        }:
             raise
         profile_complete = False
         profile = None
