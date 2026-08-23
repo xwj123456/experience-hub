@@ -615,16 +615,21 @@ def test_group_publication_cleans_final_rename_interruption(
         replace_owned=False,
         allow_unmarked_empty=True,
     )
-    real_replace = os.replace
+    real_rename = workspace_module._rename_directory_noreplace
 
     def interrupt_stage_rename(
-        source: str, destination: str, *args: object, **kwargs: object
+        source: str,
+        source_directory_fd: int,
+        destination: str,
+        destination_directory_fd: int,
     ) -> None:
         if source.startswith(".experience-hub-benchmark-stage-"):
             raise interruption("injected stage interruption")
-        real_replace(source, destination, *args, **kwargs)
+        real_rename(source, source_directory_fd, destination, destination_directory_fd)
 
-    monkeypatch.setattr(os, "replace", interrupt_stage_rename)
+    monkeypatch.setattr(
+        workspace_module, "_rename_directory_noreplace", interrupt_stage_rename
+    )
     with pytest.raises(interruption):
         workspace.atomic_write_group(_benchmark_artifact_bodies(include_profile=False))
 
@@ -642,22 +647,149 @@ def test_group_publication_cleans_final_rename_oserror(
         replace_owned=False,
         allow_unmarked_empty=True,
     )
-    real_replace = os.replace
+    real_rename = workspace_module._rename_directory_noreplace
 
     def fail_stage_rename(
-        source: str, destination: str, *args: object, **kwargs: object
+        source: str,
+        source_directory_fd: int,
+        destination: str,
+        destination_directory_fd: int,
     ) -> None:
         if source.startswith(".experience-hub-benchmark-stage-"):
             raise OSError("injected stage rename failure")
-        real_replace(source, destination, *args, **kwargs)
+        real_rename(source, source_directory_fd, destination, destination_directory_fd)
 
-    monkeypatch.setattr(os, "replace", fail_stage_rename)
+    monkeypatch.setattr(
+        workspace_module, "_rename_directory_noreplace", fail_stage_rename
+    )
     with pytest.raises(ExperimentIsolationError):
         workspace.atomic_write_group(_benchmark_artifact_bodies(include_profile=False))
 
     assert not (workspace.root / "artifacts").exists()
     staging = workspace.root / "validation"
     assert not staging.exists() or not tuple(staging.iterdir())
+
+
+def test_group_publication_never_replaces_a_racing_empty_artifacts_directory(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    workspace = prepare_owned_workspace(
+        tmp_path / "workspace",
+        policy=REPLAY_WORKSPACE_POLICY,
+        replace_owned=False,
+        allow_unmarked_empty=True,
+    )
+    existing = getattr(workspace_module, "_rename_directory_noreplace", None)
+    injected = workspace.root / "artifacts"
+
+    def create_racing_destination(
+        source: str,
+        source_directory_fd: int,
+        destination: str,
+        destination_directory_fd: int,
+    ) -> None:
+        injected.mkdir()
+        (injected / "racing-sentinel").write_bytes(b"leave-this-directory")
+        if existing is None:
+            raise AssertionError("atomic no-replace wrapper was not implemented")
+        existing(
+            source,
+            source_directory_fd,
+            destination,
+            destination_directory_fd,
+        )
+
+    monkeypatch.setattr(
+        workspace_module,
+        "_rename_directory_noreplace",
+        create_racing_destination,
+        raising=False,
+    )
+    with pytest.raises(ExperimentIsolationError) as captured:
+        workspace.atomic_write_group(_benchmark_artifact_bodies())
+
+    assert captured.value.code == "replay_workspace_write_failed"
+    assert (injected / "racing-sentinel").read_bytes() == b"leave-this-directory"
+    staging = workspace.root / "validation"
+    assert not staging.exists() or not tuple(staging.iterdir())
+
+
+@pytest.mark.parametrize("interruption", (KeyboardInterrupt, asyncio.CancelledError))
+def test_group_publication_cleans_stage_created_before_mkdir_interruption(
+    interruption: type[BaseException],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    workspace = prepare_owned_workspace(
+        tmp_path / "workspace",
+        policy=REPLAY_WORKSPACE_POLICY,
+        replace_owned=False,
+        allow_unmarked_empty=True,
+    )
+    real_mkdir = os.mkdir
+
+    def create_then_interrupt(
+        name: str, mode: int = 0o777, *, dir_fd: int | None = None
+    ) -> None:
+        real_mkdir(name, mode, dir_fd=dir_fd)
+        if name.startswith(".experience-hub-benchmark-stage-"):
+            raise interruption("injected mkdir interruption")
+
+    monkeypatch.setattr(os, "mkdir", create_then_interrupt)
+    with pytest.raises(interruption):
+        workspace.atomic_write_group(_benchmark_artifact_bodies(include_profile=False))
+
+    assert not (workspace.root / "artifacts").exists()
+    staging = workspace.root / "validation"
+    assert not staging.exists() or not tuple(staging.iterdir())
+
+
+def test_group_cleanup_refuses_a_stage_replaced_after_identity_check(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    workspace = prepare_owned_workspace(
+        tmp_path / "workspace",
+        policy=REPLAY_WORKSPACE_POLICY,
+        replace_owned=False,
+        allow_unmarked_empty=True,
+    )
+    validation = workspace.root / "validation"
+    validation.mkdir()
+    stage_name = ".experience-hub-benchmark-stage-test"
+    stage = validation / stage_name
+    stage.mkdir()
+    (stage / "benchmark-evidence.json").write_bytes(b"original-stage")
+    stage_status = os.stat(stage, follow_symlinks=False)
+    recovered = validation / "recoverable-stage"
+    replacement = validation / stage_name
+    real_open_directory = workspace_module._open_directory
+
+    def replace_before_open(name: str, parent_fd: int) -> int:
+        if name == stage_name:
+            stage.rename(recovered)
+            replacement.mkdir()
+            (replacement / "benchmark-evidence.json").write_bytes(
+                b"replacement-stage"
+            )
+        return real_open_directory(name, parent_fd)
+
+    monkeypatch.setattr(workspace_module, "_open_directory", replace_before_open)
+    validation_fd = os.open(validation, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        with pytest.raises(ExperimentIsolationError):
+            workspace_module._cleanup_benchmark_stage(
+                stage_name,
+                validation_fd,
+                stage_status,
+                frozenset({"benchmark-evidence.json"}),
+            )
+    finally:
+        os.close(validation_fd)
+
+    assert (
+        replacement / "benchmark-evidence.json"
+    ).read_bytes() == b"replacement-stage"
+    assert (recovered / "benchmark-evidence.json").read_bytes() == b"original-stage"
 
 
 def test_group_publication_reports_recoverable_stage_cleanup_failure(

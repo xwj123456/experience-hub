@@ -10,10 +10,12 @@ workspace contract.
 from __future__ import annotations
 
 import asyncio
+import ctypes
 import fcntl
 import os
 import secrets
 import stat
+import sys
 from collections.abc import Mapping
 from contextlib import suppress
 from dataclasses import dataclass
@@ -25,6 +27,8 @@ from experience_hub.experiments.errors import ExperimentIsolationError
 _DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
 _TEMPORARY_SUFFIX = ".experience-hub.tmp"
 _BENCHMARK_STAGE_PREFIX = ".experience-hub-benchmark-stage-"
+_RENAME_EXCL = 0x00000004
+_RENAME_NOREPLACE = 0x00000001
 
 
 @dataclass(frozen=True, slots=True)
@@ -488,11 +492,11 @@ class OwnedWorkspace:
             _require_entry_identity("validation", root_fd, validation_status)
             _require_missing_directory("artifacts", root_fd)
             _require_path_identity(self.root, root_fd)
-            os.replace(
+            _rename_directory_noreplace(
                 stage_name,
+                validation_fd,
                 "artifacts",
-                src_dir_fd=validation_fd,
-                dst_dir_fd=root_fd,
+                root_fd,
             )
             published = True
             _require_entry_identity("artifacts", root_fd, stage_status)
@@ -508,6 +512,7 @@ class OwnedWorkspace:
                         validation_fd,
                         stage_status,
                         stage_member_names,
+                        stage_fd=stage_fd,
                     )
                 except BaseException:
                     raise _stage_cleanup_failed() from None
@@ -520,6 +525,7 @@ class OwnedWorkspace:
                         validation_fd,
                         stage_status,
                         stage_member_names,
+                        stage_fd=stage_fd,
                     )
                 except BaseException:
                     raise _stage_cleanup_failed() from None
@@ -554,9 +560,14 @@ def _create_benchmark_stage(
             os.mkdir(name, mode=0o700, dir_fd=validation_fd)
         except FileExistsError:
             continue
-        except OSError:
-            raise _write_failed() from None
+        except BaseException:
+            try:
+                _cleanup_maybe_created_benchmark_stage(name, validation_fd)
+            except BaseException:
+                raise _stage_cleanup_failed() from None
+            raise
         descriptor = -1
+        status: os.stat_result | None = None
         try:
             status = os.stat(name, dir_fd=validation_fd, follow_symlinks=False)
             if stat.S_ISLNK(status.st_mode) or not stat.S_ISDIR(status.st_mode):
@@ -566,14 +577,29 @@ def _create_benchmark_stage(
             _require_entry_identity(name, validation_fd, status)
             return name, descriptor, status
         except BaseException:
-            if descriptor >= 0:
-                os.close(descriptor)
             try:
-                _cleanup_benchmark_stage(
-                    name, validation_fd, None, frozenset()
-                )
+                if descriptor >= 0 and status is not None:
+                    _cleanup_benchmark_stage(
+                        name,
+                        validation_fd,
+                        status,
+                        frozenset(),
+                        stage_fd=descriptor,
+                    )
+                elif status is not None:
+                    _cleanup_benchmark_stage(
+                        name,
+                        validation_fd,
+                        status,
+                        frozenset(),
+                    )
+                else:
+                    _cleanup_maybe_created_benchmark_stage(name, validation_fd)
             except BaseException:
                 raise _stage_cleanup_failed() from None
+            finally:
+                if descriptor >= 0:
+                    os.close(descriptor)
             raise
     raise _write_failed()
 
@@ -601,13 +627,19 @@ def _cleanup_benchmark_stage(
     validation_fd: int,
     stage_status: os.stat_result | None,
     expected_names: frozenset[str],
+    *,
+    stage_fd: int | None = None,
 ) -> None:
     status = stage_status or _lstat(stage_name, validation_fd)
     if not stat.S_ISDIR(status.st_mode):
         raise _path_invalid()
-    _require_entry_identity(stage_name, validation_fd, status)
-    stage_fd = _open_directory(stage_name, validation_fd)
+    opened_stage_fd = -1
+    if stage_fd is None:
+        opened_stage_fd = _open_directory(stage_name, validation_fd)
+        stage_fd = opened_stage_fd
     try:
+        _require_identity_status(os.fstat(stage_fd), status)
+        _require_entry_identity(stage_name, validation_fd, status)
         names = _list_entries(stage_fd)
         if any(name not in expected_names for name in names):
             raise _path_invalid()
@@ -619,7 +651,72 @@ def _cleanup_benchmark_stage(
         _require_entry_identity(stage_name, validation_fd, status)
         os.rmdir(stage_name, dir_fd=validation_fd)
     finally:
+        if opened_stage_fd >= 0:
+            os.close(opened_stage_fd)
+
+
+def _cleanup_maybe_created_benchmark_stage(name: str, validation_fd: int) -> None:
+    try:
+        status = os.stat(name, dir_fd=validation_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    except OSError:
+        raise _unowned() from None
+    if stat.S_ISLNK(status.st_mode) or not stat.S_ISDIR(status.st_mode):
+        raise _path_invalid()
+    stage_fd = _open_directory(name, validation_fd)
+    try:
+        _require_identity_status(os.fstat(stage_fd), status)
+        _cleanup_benchmark_stage(
+            name,
+            validation_fd,
+            status,
+            frozenset(),
+            stage_fd=stage_fd,
+        )
+    finally:
         os.close(stage_fd)
+
+
+def _rename_directory_noreplace(
+    source_name: str,
+    source_directory_fd: int,
+    destination_name: str,
+    destination_directory_fd: int,
+) -> None:
+    """Atomically publish a directory only while its destination is absent."""
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        if sys.platform == "darwin":
+            rename = libc.renameatx_np
+            flags = _RENAME_EXCL
+        elif sys.platform == "linux":
+            rename = libc.renameat2
+            flags = _RENAME_NOREPLACE
+        else:
+            raise _write_failed()
+    except AttributeError:
+        raise _write_failed() from None
+    except OSError:
+        raise _write_failed() from None
+    rename.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    rename.restype = ctypes.c_int
+    result = rename(
+        source_directory_fd,
+        os.fsencode(source_name),
+        destination_directory_fd,
+        os.fsencode(destination_name),
+        flags,
+    )
+    if result != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number), destination_name)
 
 
 def _sync_directory(directory_fd: int) -> None:
