@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 from pathlib import Path, PurePosixPath
+from typing import NoReturn
 from uuid import UUID
 
 from pydantic import BaseModel
@@ -59,11 +60,37 @@ class BenchmarkArtifactSet:
     profile_body: bytes | None
 
 
+@dataclass(frozen=True, slots=True)
+class _ModelPreflightFrame:
+    fields: Iterator[str]
+    model: BaseModel
+    identity: int
+
+
+@dataclass(frozen=True, slots=True)
+class _MappingPreflightFrame:
+    items: Iterator[tuple[object, object]]
+    has_item: bool
+    identity: int
+
+
+@dataclass(frozen=True, slots=True)
+class _SequencePreflightFrame:
+    items: Iterator[object]
+    has_item: bool
+    identity: int
+
+
 def _reject(code: str, message: str) -> ExperimentOutputError:
     return ExperimentOutputError(code, message)
 
 
-def _require_bounded_canonical_shape(value: object, *, document: str) -> None:
+def _require_bounded_canonical_shape(
+    value: object,
+    *,
+    document: str,
+    error_code: str = "invalid_benchmark_evidence",
+) -> None:
     """Reject oversized model graphs before dump/copy/JSON allocation.
 
     This walks references one value at a time and charges the exact JSON
@@ -74,6 +101,10 @@ def _require_bounded_canonical_shape(value: object, *, document: str) -> None:
 
     total = 0
     pending: list[tuple[str, object]] = [("value", value)]
+    active: set[int] = set()
+
+    def invalid(message: str = "is invalid") -> NoReturn:
+        raise _reject(error_code, f"{document} {message}")
 
     def charge(amount: int) -> None:
         nonlocal total
@@ -118,87 +149,118 @@ def _require_bounded_canonical_shape(value: object, *, document: str) -> None:
             elif isinstance(item, Enum):
                 pending.append(("value", item.value))
             elif isinstance(item, BaseModel):
+                identity = id(item)
+                if identity in active:
+                    invalid("contains a cyclic value")
+                active.add(identity)
                 charge(2)
-                pending.append(("model", (iter(type(item).model_fields), item)))
+                pending.append(
+                    (
+                        "model",
+                        _ModelPreflightFrame(
+                            fields=iter(type(item).model_fields),
+                            model=item,
+                            identity=identity,
+                        ),
+                    )
+                )
             elif isinstance(item, Mapping):
+                identity = id(item)
+                if identity in active:
+                    invalid("contains a cyclic value")
+                active.add(identity)
                 charge(2)
-                pending.append(("mapping", (iter(item.items()), False)))
+                pending.append(
+                    (
+                        "mapping",
+                        _MappingPreflightFrame(
+                            items=iter(item.items()),
+                            has_item=False,
+                            identity=identity,
+                        ),
+                    )
+                )
             elif isinstance(item, (list, tuple)):
+                identity = id(item)
+                if identity in active:
+                    invalid("contains a cyclic value")
+                active.add(identity)
                 charge(2)
-                pending.append(("sequence", (iter(item), False)))
+                pending.append(
+                    (
+                        "sequence",
+                        _SequencePreflightFrame(
+                            items=iter(item),
+                            has_item=False,
+                            identity=identity,
+                        ),
+                    )
+                )
             else:
-                raise _reject(
-                    "invalid_benchmark_evidence", f"{document} is invalid"
-                )
+                invalid()
         elif kind == "model":
-            if not isinstance(item, tuple) or len(item) != 2:
-                raise _reject(
-                    "invalid_benchmark_evidence", f"{document} is invalid"
-                )
-            fields, model = item
-            if not isinstance(fields, Iterator) or not isinstance(model, BaseModel):
-                raise _reject(
-                    "invalid_benchmark_evidence", f"{document} is invalid"
-                )
+            if not isinstance(item, _ModelPreflightFrame):
+                invalid()
             try:
-                field_name = next(fields)
+                field_name = next(item.fields)
             except StopIteration:
+                active.discard(item.identity)
                 continue
-            if not isinstance(field_name, str):
-                raise _reject(
-                    "invalid_benchmark_evidence", f"{document} is invalid"
-                )
             # One extra byte safely covers each field separator (including the
             # first field, where it intentionally overestimates by one byte).
             charge(1)
             charge_string(field_name)
             charge(1)
-            pending.append(("model", (fields, model)))
-            pending.append(("value", getattr(model, field_name)))
+            pending.append(("model", item))
+            pending.append(("value", getattr(item.model, field_name)))
         elif kind == "mapping":
-            if not isinstance(item, tuple) or len(item) != 2:
-                raise _reject(
-                    "invalid_benchmark_evidence", f"{document} is invalid"
-                )
-            items, has_item = item
-            if not isinstance(items, Iterator) or not isinstance(has_item, bool):
-                raise _reject(
-                    "invalid_benchmark_evidence", f"{document} is invalid"
-                )
+            if not isinstance(item, _MappingPreflightFrame):
+                invalid()
             try:
-                key, child = next(items)
+                key, child = next(item.items)
             except StopIteration:
+                active.discard(item.identity)
                 continue
             if not isinstance(key, str):
-                raise _reject(
-                    "invalid_benchmark_evidence", f"{document} is invalid"
-                )
-            if has_item:
+                invalid()
+            if item.has_item:
                 charge(1)
             charge_string(key)
             charge(1)
-            pending.append(("mapping", (items, True)))
+            pending.append(
+                (
+                    "mapping",
+                    _MappingPreflightFrame(
+                        items=item.items,
+                        has_item=True,
+                        identity=item.identity,
+                    ),
+                )
+            )
             pending.append(("value", child))
         elif kind == "sequence":
-            if not isinstance(item, tuple) or len(item) != 2:
-                raise _reject(
-                    "invalid_benchmark_evidence", f"{document} is invalid"
-                )
-            items, has_item = item
-            if not isinstance(items, Iterator) or not isinstance(has_item, bool):
-                raise _reject(
-                    "invalid_benchmark_evidence", f"{document} is invalid"
-                )
+            if not isinstance(item, _SequencePreflightFrame):
+                invalid()
             try:
-                child = next(items)
+                child = next(item.items)
             except StopIteration:
+                active.discard(item.identity)
                 continue
-            if has_item:
+            if item.has_item:
                 charge(1)
-            pending.append(("sequence", (items, True)))
+            pending.append(
+                (
+                    "sequence",
+                    _SequencePreflightFrame(
+                        items=item.items,
+                        has_item=True,
+                        identity=item.identity,
+                    ),
+                )
+            )
             pending.append(("value", child))
         else:
-            raise _reject("invalid_benchmark_evidence", f"{document} is invalid")
+            invalid()
 
 
 def _safe_document(
@@ -287,6 +349,21 @@ def _validate_case(case: BenchmarkCaseEvidenceV1) -> BenchmarkCaseEvidenceV1:
     return expected
 
 
+def _validate_embedded_cases_hash(payload: BenchmarkPassPayloadV1) -> None:
+    try:
+        cases_body = b"".join(
+            canonical_json_bytes(case.case) + b"\n" for case in payload.cases
+        )
+    except Exception:
+        raise _reject(
+            "invalid_benchmark_evidence", "Benchmark cases are invalid"
+        ) from None
+    if sha256_hex(cases_body) != payload.resolved_manifest.cases_sha256:
+        raise _reject(
+            "invalid_benchmark_evidence", "Benchmark cases do not match manifest"
+        )
+
+
 def _validated_pass(payload: BenchmarkPassPayloadV1) -> BenchmarkPassPayloadV1:
     if not isinstance(payload, BenchmarkPassPayloadV1):
         raise _reject("invalid_benchmark_evidence", "Benchmark pass is invalid")
@@ -304,6 +381,7 @@ def _validated_pass(payload: BenchmarkPassPayloadV1) -> BenchmarkPassPayloadV1:
         raise _reject(
             "invalid_benchmark_evidence", "Benchmark pass is invalid"
         ) from None
+    _validate_embedded_cases_hash(validated)
     cases = tuple(_validate_case(case) for case in validated.cases)
     try:
         aggregate = aggregate_benchmark_cases(cases)
@@ -479,7 +557,11 @@ def canonical_benchmark_summary_bytes(summary: BenchmarkSummaryReportV1) -> byte
     """Encode an already-derived benchmark summary within the output cap."""
     if not isinstance(summary, BenchmarkSummaryReportV1):
         raise _reject("invalid_benchmark_summary", "Benchmark summary is invalid")
-    _require_bounded_canonical_shape(summary, document="Benchmark summary")
+    _require_bounded_canonical_shape(
+        summary,
+        document="Benchmark summary",
+        error_code="invalid_benchmark_summary",
+    )
     try:
         document = summary.model_dump(mode="python", warnings=False)
         _safe_document(
@@ -540,7 +622,11 @@ def canonical_benchmark_profile_bytes(profile: BenchmarkProfileReportV1) -> byte
     """Encode profile-only runtime measurements independently from evidence."""
     if not isinstance(profile, BenchmarkProfileReportV1):
         raise _reject("invalid_benchmark_profile", "Benchmark profile is invalid")
-    _require_bounded_canonical_shape(profile, document="Benchmark profile")
+    _require_bounded_canonical_shape(
+        profile,
+        document="Benchmark profile",
+        error_code="invalid_benchmark_profile",
+    )
     try:
         validated = BenchmarkProfileReportV1.model_validate(
             profile.model_dump(mode="python", warnings=False), strict=True
@@ -564,9 +650,11 @@ def write_benchmark_artifacts(
 ) -> BenchmarkArtifactSet:
     """Publish one profile/summary/evidence generation as an owned set.
 
-    Workspace-locked readers observe either complete generation.  Readers that
-    bypass that lock must verify the evidence-summary hash and fail closed if a
-    concurrent rename makes the pair temporarily unavailable or mismatched.
+    The complete set stages privately and is exposed by one rename only while
+    ``artifacts/`` is absent. Readers therefore see no public directory before
+    that rename or one complete immutable generation afterwards; a pre-existing
+    generation is rejected unchanged. A reader that sees absence or malformed
+    bytes must fail closed rather than treating either as partial evidence.
     """
     if not isinstance(workspace, OwnedWorkspace):
         raise _reject(

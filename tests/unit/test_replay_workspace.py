@@ -442,6 +442,262 @@ def test_atomic_write_replaces_an_existing_artifact(tmp_path: Path) -> None:
     assert (workspace.root / relative).read_bytes() == b"new"
 
 
+def _benchmark_artifact_bodies(
+    *, include_profile: bool = True
+) -> dict[PurePosixPath, bytes | None]:
+    return {
+        PurePosixPath("artifacts/benchmark-evidence.json"): b"evidence",
+        PurePosixPath("artifacts/benchmark-summary.json"): b"summary",
+        PurePosixPath("artifacts/profile.json"): (
+            b"profile" if include_profile else None
+        ),
+    }
+
+
+@pytest.mark.parametrize("failure_position", (1, 2, 3))
+def test_group_publication_cleans_every_staged_member_failure(
+    failure_position: int, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    workspace = prepare_owned_workspace(
+        tmp_path / "workspace",
+        policy=REPLAY_WORKSPACE_POLICY,
+        replace_owned=False,
+        allow_unmarked_empty=True,
+    )
+    calls = 0
+    real_write = workspace_module._write_and_read_back
+
+    def fail_staged_write(file_fd: int, body: bytes) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == failure_position:
+            raise OSError("injected staged-member failure")
+        real_write(file_fd, body)
+
+    monkeypatch.setattr(workspace_module, "_write_and_read_back", fail_staged_write)
+    with pytest.raises(ExperimentIsolationError):
+        workspace.atomic_write_group(_benchmark_artifact_bodies())
+
+    assert not (workspace.root / "artifacts").exists()
+    staging = workspace.root / "validation"
+    assert not staging.exists() or not tuple(staging.iterdir())
+
+
+def test_group_publication_rejects_existing_artifacts_without_replacing_them(
+    tmp_path: Path,
+) -> None:
+    workspace = prepare_owned_workspace(
+        tmp_path / "workspace",
+        policy=REPLAY_WORKSPACE_POLICY,
+        replace_owned=False,
+        allow_unmarked_empty=True,
+    )
+    first = workspace.atomic_write_group(_benchmark_artifact_bodies())
+    previous = {
+        path: (path.read_bytes(), path.stat().st_ino)
+        for path in first.values()
+        if path is not None
+    }
+
+    with pytest.raises(ExperimentIsolationError):
+        workspace.atomic_write_group(_benchmark_artifact_bodies(include_profile=False))
+
+    assert {
+        path: (path.read_bytes(), path.stat().st_ino) for path in previous
+    } == previous
+
+
+def test_group_publication_requires_the_single_artifacts_parent(tmp_path: Path) -> None:
+    workspace = prepare_owned_workspace(
+        tmp_path / "workspace",
+        policy=REPLAY_WORKSPACE_POLICY,
+        replace_owned=False,
+        allow_unmarked_empty=True,
+    )
+
+    with pytest.raises(ExperimentIsolationError):
+        workspace.atomic_write_group(
+            {
+                PurePosixPath("artifacts/benchmark-evidence.json"): b"evidence",
+                PurePosixPath("validation/benchmark-summary.json"): b"summary",
+            }
+        )
+
+    assert not (workspace.root / "artifacts").exists()
+    assert not (workspace.root / "validation").exists()
+
+
+def test_group_publication_cleans_postwrite_fsync_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    workspace = prepare_owned_workspace(
+        tmp_path / "workspace",
+        policy=REPLAY_WORKSPACE_POLICY,
+        replace_owned=False,
+        allow_unmarked_empty=True,
+    )
+    calls = 0
+    real_fsync = os.fsync
+
+    def fail_stage_fsync(file_fd: int) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 4:
+            raise OSError("injected stage fsync failure")
+        real_fsync(file_fd)
+
+    monkeypatch.setattr(os, "fsync", fail_stage_fsync)
+    with pytest.raises(ExperimentIsolationError):
+        workspace.atomic_write_group(_benchmark_artifact_bodies())
+
+    assert not (workspace.root / "artifacts").exists()
+
+
+def test_group_publication_cleans_postwrite_validation_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    workspace = prepare_owned_workspace(
+        tmp_path / "workspace",
+        policy=REPLAY_WORKSPACE_POLICY,
+        replace_owned=False,
+        allow_unmarked_empty=True,
+    )
+
+    def fail_validation(*args: object, **kwargs: object) -> None:
+        raise OSError("injected stage validation failure")
+
+    monkeypatch.setattr(
+        workspace_module, "_validate_benchmark_stage", fail_validation
+    )
+    with pytest.raises(ExperimentIsolationError):
+        workspace.atomic_write_group(_benchmark_artifact_bodies())
+
+    assert not (workspace.root / "artifacts").exists()
+    staging = workspace.root / "validation"
+    assert not staging.exists() or not tuple(staging.iterdir())
+
+
+def test_group_publication_cleans_staging_fstat_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    workspace = prepare_owned_workspace(
+        tmp_path / "workspace",
+        policy=REPLAY_WORKSPACE_POLICY,
+        replace_owned=False,
+        allow_unmarked_empty=True,
+    )
+    calls = 0
+    real_fstat = os.fstat
+
+    def fail_member_fstat(file_fd: int) -> os.stat_result:
+        nonlocal calls
+        calls += 1
+        if calls == 3:
+            raise OSError("injected member fstat failure")
+        return real_fstat(file_fd)
+
+    monkeypatch.setattr(os, "fstat", fail_member_fstat)
+    with pytest.raises(ExperimentIsolationError):
+        workspace.atomic_write_group(_benchmark_artifact_bodies())
+
+    assert not (workspace.root / "artifacts").exists()
+
+
+@pytest.mark.parametrize("interruption", (KeyboardInterrupt, asyncio.CancelledError))
+def test_group_publication_cleans_final_rename_interruption(
+    interruption: type[BaseException],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    workspace = prepare_owned_workspace(
+        tmp_path / "workspace",
+        policy=REPLAY_WORKSPACE_POLICY,
+        replace_owned=False,
+        allow_unmarked_empty=True,
+    )
+    real_replace = os.replace
+
+    def interrupt_stage_rename(
+        source: str, destination: str, *args: object, **kwargs: object
+    ) -> None:
+        if source.startswith(".experience-hub-benchmark-stage-"):
+            raise interruption("injected stage interruption")
+        real_replace(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(os, "replace", interrupt_stage_rename)
+    with pytest.raises(interruption):
+        workspace.atomic_write_group(_benchmark_artifact_bodies(include_profile=False))
+
+    assert not (workspace.root / "artifacts").exists()
+    staging = workspace.root / "validation"
+    assert not staging.exists() or not tuple(staging.iterdir())
+
+
+def test_group_publication_cleans_final_rename_oserror(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    workspace = prepare_owned_workspace(
+        tmp_path / "workspace",
+        policy=REPLAY_WORKSPACE_POLICY,
+        replace_owned=False,
+        allow_unmarked_empty=True,
+    )
+    real_replace = os.replace
+
+    def fail_stage_rename(
+        source: str, destination: str, *args: object, **kwargs: object
+    ) -> None:
+        if source.startswith(".experience-hub-benchmark-stage-"):
+            raise OSError("injected stage rename failure")
+        real_replace(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(os, "replace", fail_stage_rename)
+    with pytest.raises(ExperimentIsolationError):
+        workspace.atomic_write_group(_benchmark_artifact_bodies(include_profile=False))
+
+    assert not (workspace.root / "artifacts").exists()
+    staging = workspace.root / "validation"
+    assert not staging.exists() or not tuple(staging.iterdir())
+
+
+def test_group_publication_reports_recoverable_stage_cleanup_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    workspace = prepare_owned_workspace(
+        tmp_path / "workspace",
+        policy=REPLAY_WORKSPACE_POLICY,
+        replace_owned=False,
+        allow_unmarked_empty=True,
+    )
+    fsync_calls = 0
+    real_fsync = os.fsync
+    real_unlink = os.unlink
+
+    def fail_stage_fsync(file_fd: int) -> None:
+        nonlocal fsync_calls
+        fsync_calls += 1
+        if fsync_calls == 4:
+            raise OSError("injected stage fsync failure")
+        real_fsync(file_fd)
+
+    def retain_staging_member(
+        name: str, *args: object, **kwargs: object
+    ) -> None:
+        if name == "benchmark-evidence.json":
+            raise OSError("injected cleanup failure")
+        real_unlink(name, *args, **kwargs)
+
+    monkeypatch.setattr(os, "fsync", fail_stage_fsync)
+    monkeypatch.setattr(os, "unlink", retain_staging_member)
+    with pytest.raises(ExperimentIsolationError) as captured:
+        workspace.atomic_write_group(_benchmark_artifact_bodies())
+
+    assert captured.value.code == "replay_workspace_stage_cleanup_failed"
+    assert not (workspace.root / "artifacts").exists()
+    staging = workspace.root / "validation"
+    assert staging.exists() and tuple(staging.iterdir())
+
+
 def test_atomic_write_waits_for_a_cooperating_workspace_lock(tmp_path: Path) -> None:
     workspace = prepare_owned_workspace(
         tmp_path / "workspace",

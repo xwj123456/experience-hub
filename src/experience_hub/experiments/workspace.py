@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import fcntl
 import os
+import secrets
 import stat
 from collections.abc import Mapping
 from contextlib import suppress
@@ -23,6 +24,7 @@ from experience_hub.experiments.errors import ExperimentIsolationError
 
 _DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
 _TEMPORARY_SUFFIX = ".experience-hub.tmp"
+_BENCHMARK_STAGE_PREFIX = ".experience-hub-benchmark-stage-"
 
 
 @dataclass(frozen=True, slots=True)
@@ -407,12 +409,10 @@ class OwnedWorkspace:
     def atomic_write_group(
         self, bodies: Mapping[PurePosixPath, bytes | None]
     ) -> dict[PurePosixPath, Path | None]:
-        """Publish one owned artifact set with rollback under one workspace lock.
+        """Publish one immutable artifact directory under one workspace lock.
 
-        Cooperating readers that use this workspace's locked file checks observe
-        the complete old set or complete new set. Direct, non-cooperating path
-        readers can observe a brief target absence or mixed set during POSIX
-        renames and must fail closed when the summary/evidence binding fails.
+        The destination directory must be absent: publication has one rename
+        point and never replaces an existing public artifact generation.
         """
         if not isinstance(bodies, Mapping) or not bodies:
             raise _path_invalid()
@@ -420,29 +420,26 @@ class OwnedWorkspace:
         for relative, body in bodies.items():
             parts = _safe_relative_parts(relative)
             if (
-                parts[0] not in self._policy.owned_entries
+                len(parts) != 2
+                or parts[0] != "artifacts"
+                or parts[0] not in self._policy.owned_entries
                 or not isinstance(body, (bytes, type(None)))
             ):
                 raise _path_invalid()
             entries.append((relative, parts, body))
         if len({parts for _, parts, _ in entries}) != len(entries):
             raise _path_invalid()
+        stage_member_names = frozenset(
+            parts[-1] for _, parts, body in entries if body is not None
+        )
 
         root_fd = -1
-        parent_fds: dict[tuple[str, ...], int] = {}
-        parent_links: list[tuple[int, str, int]] = []
-        states: list[
-            tuple[
-                PurePosixPath,
-                tuple[str, ...],
-                bytes | None,
-                int,
-                os.stat_result | None,
-            ]
-        ] = []
-        temporary: dict[tuple[str, ...], tuple[str, os.stat_result]] = {}
-        backups: dict[tuple[str, ...], tuple[str, os.stat_result]] = {}
-        installed: set[tuple[str, ...]] = set()
+        validation_fd = -1
+        stage_fd = -1
+        validation_status: os.stat_result | None = None
+        stage_name: str | None = None
+        stage_status: os.stat_result | None = None
+        published = False
         locked = False
         try:
             root_fd = _open_existing_root(self.root)
@@ -450,112 +447,186 @@ class OwnedWorkspace:
             locked = True
             _require_identity(root_fd, self._device, self._inode)
             _validate_current_ownership(root_fd, self._policy)
-            for relative, parts, body in entries:
-                _require_safe_relative_path(root_fd, parts)
-                parent = root_fd
-                key: tuple[str, ...] = ()
-                for part in parts[:-1]:
-                    key = (*key, part)
-                    if key not in parent_fds:
-                        child = _open_or_create_directory(part, parent)
-                        parent_fds[key] = child
-                        parent_links.append((parent, part, child))
-                    parent = parent_fds[key]
-                try:
-                    previous = os.stat(
-                        parts[-1], dir_fd=parent, follow_symlinks=False
-                    )
-                except FileNotFoundError:
-                    previous = None
-                except OSError:
-                    raise _path_invalid() from None
-                else:
-                    if previous is None:
-                        raise _path_invalid()
-                    if (
-                        stat.S_ISLNK(previous.st_mode)
-                        or not stat.S_ISREG(previous.st_mode)
-                    ):
-                        raise _path_invalid()
-                states.append((relative, parts, body, parent, previous))
-            for _, parts, body, parent, _ in states:
+            _require_missing_directory("artifacts", root_fd)
+            validation_fd = _open_or_create_directory("validation", root_fd)
+            validation_status = os.fstat(validation_fd)
+            if not stat.S_ISDIR(validation_status.st_mode):
+                raise _path_invalid()
+            _require_entry_identity("validation", root_fd, validation_status)
+            if any(
+                name.startswith(_BENCHMARK_STAGE_PREFIX)
+                for name in _list_entries(validation_fd)
+            ):
+                raise _stage_cleanup_failed()
+            stage_name, stage_fd, stage_status = _create_benchmark_stage(validation_fd)
+            for _, parts, body in entries:
                 if body is None:
                     continue
-                temporary_name = f".{parts[-1]}{_TEMPORARY_SUFFIX}"
-                descriptor = _create_temporary(temporary_name, parent)
+                descriptor = os.open(
+                    parts[-1],
+                    os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                    0o600,
+                    dir_fd=stage_fd,
+                )
                 try:
-                    _write_and_read_back(descriptor, body)
                     status = os.fstat(descriptor)
+                    if not stat.S_ISREG(status.st_mode):
+                        raise _path_invalid()
+                    _write_and_read_back(descriptor, body)
                 finally:
                     os.close(descriptor)
-                temporary[parts] = (temporary_name, status)
-            _require_linked_directories(parent_links)
+                _require_entry_identity(parts[-1], stage_fd, status)
+            _validate_benchmark_stage(
+                stage_fd,
+                expected_names=stage_member_names,
+                stage_name=stage_name,
+                validation_fd=validation_fd,
+                stage_status=stage_status,
+            )
+            _sync_directory(stage_fd)
+            _sync_directory(validation_fd)
+            _require_entry_identity("validation", root_fd, validation_status)
+            _require_missing_directory("artifacts", root_fd)
             _require_path_identity(self.root, root_fd)
-            for _, parts, _, parent, previous in states:
-                if previous is None:
-                    continue
-                backup_name = f".{parts[-1]}.experience-hub.backup"
-                try:
-                    os.stat(backup_name, dir_fd=parent, follow_symlinks=False)
-                except FileNotFoundError:
-                    pass
-                except OSError:
-                    raise _path_invalid() from None
-                else:
-                    raise _path_invalid()
-                os.replace(
-                    parts[-1], backup_name, src_dir_fd=parent, dst_dir_fd=parent
-                )
-                _require_entry_identity(backup_name, parent, previous)
-                backups[parts] = (backup_name, previous)
-            for _, parts, body, parent, _ in states:
-                if body is None:
-                    continue
-                temporary_name, status = temporary[parts]
-                _commit_temporary(temporary_name, parts[-1], parent, status)
-                installed.add(parts)
-            _require_linked_directories(parent_links)
-            _require_path_identity(self.root, root_fd)
-            for _, parts, _, parent, _ in states:
-                backup = backups.pop(parts, None)
-                if backup is not None:
-                    _unlink_same_entry(backup[0], parent, backup[1])
+            os.replace(
+                stage_name,
+                "artifacts",
+                src_dir_fd=validation_fd,
+                dst_dir_fd=root_fd,
+            )
+            published = True
+            _require_entry_identity("artifacts", root_fd, stage_status)
             return {
                 relative: self.root.joinpath(*parts) if body is not None else None
                 for relative, parts, body in entries
             }
-        except (ExperimentIsolationError, OSError):
-            for _, parts, _, parent, previous in reversed(states):
-                if parts in installed:
-                    with suppress(ExperimentIsolationError):
-                        _unlink_same_entry(parts[-1], parent, temporary[parts][1])
-                backup = backups.get(parts)
-                if backup is not None:
-                    with suppress(OSError):
-                        os.replace(
-                            backup[0], parts[-1], src_dir_fd=parent, dst_dir_fd=parent
-                        )
-                elif previous is None:
-                    with suppress(FileNotFoundError):
-                        os.unlink(parts[-1], dir_fd=parent)
+        except OSError:
+            if stage_name is not None and not published and validation_fd >= 0:
+                try:
+                    _cleanup_benchmark_stage(
+                        stage_name,
+                        validation_fd,
+                        stage_status,
+                        stage_member_names,
+                    )
+                except BaseException:
+                    raise _stage_cleanup_failed() from None
+            raise _write_failed() from None
+        except BaseException:
+            if stage_name is not None and not published and validation_fd >= 0:
+                try:
+                    _cleanup_benchmark_stage(
+                        stage_name,
+                        validation_fd,
+                        stage_status,
+                        stage_member_names,
+                    )
+                except BaseException:
+                    raise _stage_cleanup_failed() from None
             raise
         finally:
-            for parts, (name, _) in temporary.items():
-                parent = next(
-                    parent for _, item, _, parent, _ in states if item == parts
-                )
-                _unlink_if_owned_temporary(name, parent)
-            for parts, (name, status) in backups.items():
-                parent = next(
-                    parent for _, item, _, parent, _ in states if item == parts
-                )
-                _rollback_created_entry(name, parent, status)
-            for directory_fd in reversed(tuple(parent_fds.values())):
-                os.close(directory_fd)
+            if stage_fd >= 0:
+                os.close(stage_fd)
+            if validation_fd >= 0:
+                os.close(validation_fd)
             if locked:
                 _unlock_workspace(root_fd)
             if root_fd >= 0:
                 os.close(root_fd)
+
+
+def _require_missing_directory(name: str, directory_fd: int) -> None:
+    try:
+        os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    except OSError:
+        raise _path_invalid() from None
+    raise _path_invalid()
+
+
+def _create_benchmark_stage(
+    validation_fd: int,
+) -> tuple[str, int, os.stat_result]:
+    for _ in range(16):
+        name = f"{_BENCHMARK_STAGE_PREFIX}{secrets.token_hex(16)}"
+        try:
+            os.mkdir(name, mode=0o700, dir_fd=validation_fd)
+        except FileExistsError:
+            continue
+        except OSError:
+            raise _write_failed() from None
+        descriptor = -1
+        try:
+            status = os.stat(name, dir_fd=validation_fd, follow_symlinks=False)
+            if stat.S_ISLNK(status.st_mode) or not stat.S_ISDIR(status.st_mode):
+                raise _path_invalid()
+            descriptor = _open_directory(name, validation_fd)
+            _require_identity_status(os.fstat(descriptor), status)
+            _require_entry_identity(name, validation_fd, status)
+            return name, descriptor, status
+        except BaseException:
+            if descriptor >= 0:
+                os.close(descriptor)
+            try:
+                _cleanup_benchmark_stage(
+                    name, validation_fd, None, frozenset()
+                )
+            except BaseException:
+                raise _stage_cleanup_failed() from None
+            raise
+    raise _write_failed()
+
+
+def _validate_benchmark_stage(
+    stage_fd: int,
+    *,
+    expected_names: frozenset[str],
+    stage_name: str,
+    validation_fd: int,
+    stage_status: os.stat_result,
+) -> None:
+    entries = _list_entries(stage_fd)
+    if frozenset(entries) != expected_names:
+        raise _path_invalid()
+    for name in entries:
+        status = _lstat(name, stage_fd)
+        if not stat.S_ISREG(status.st_mode):
+            raise _path_invalid()
+    _require_entry_identity(stage_name, validation_fd, stage_status)
+
+
+def _cleanup_benchmark_stage(
+    stage_name: str,
+    validation_fd: int,
+    stage_status: os.stat_result | None,
+    expected_names: frozenset[str],
+) -> None:
+    status = stage_status or _lstat(stage_name, validation_fd)
+    if not stat.S_ISDIR(status.st_mode):
+        raise _path_invalid()
+    _require_entry_identity(stage_name, validation_fd, status)
+    stage_fd = _open_directory(stage_name, validation_fd)
+    try:
+        names = _list_entries(stage_fd)
+        if any(name not in expected_names for name in names):
+            raise _path_invalid()
+        for name in names:
+            member = _lstat(name, stage_fd)
+            if not stat.S_ISREG(member.st_mode):
+                raise _path_invalid()
+            _unlink_same_entry(name, stage_fd, member)
+        _require_entry_identity(stage_name, validation_fd, status)
+        os.rmdir(stage_name, dir_fd=validation_fd)
+    finally:
+        os.close(stage_fd)
+
+
+def _sync_directory(directory_fd: int) -> None:
+    try:
+        os.fsync(directory_fd)
+    except OSError:
+        raise _write_failed() from None
 
 
 def prepare_owned_workspace(
@@ -1107,4 +1178,11 @@ def _path_invalid() -> ExperimentIsolationError:
 def _write_failed() -> ExperimentIsolationError:
     return ExperimentIsolationError(
         "replay_workspace_write_failed", "artifact could not be written atomically"
+    )
+
+
+def _stage_cleanup_failed() -> ExperimentIsolationError:
+    return ExperimentIsolationError(
+        "replay_workspace_stage_cleanup_failed",
+        "artifact staging could not be safely cleaned"
     )

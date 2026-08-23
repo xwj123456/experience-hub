@@ -13,9 +13,6 @@ from experience_hub.experiments import (
     ExperimentOutputError,
     prepare_owned_workspace,
 )
-from experience_hub.experiments import (
-    workspace as workspace_module,
-)
 from experience_hub.experiments.benchmarks.contracts import (
     BENCHMARK_ARM_ORDER,
     BENCHMARK_STRATUM_ORDER,
@@ -51,13 +48,13 @@ from experience_hub.experiments.benchmarks.reports import (
 )
 
 
-def _manifest() -> ResolvedBenchmarkManifestV1:
+def _manifest(*, cases_sha256: str = "b" * 64) -> ResolvedBenchmarkManifestV1:
     return ResolvedBenchmarkManifestV1(
         schema_version=1,
         pack_id="experiencebench-s-pilot",
         maturity="pilot-30",
         manifest_sha256="a" * 64,
-        cases_sha256="b" * 64,
+        cases_sha256=cases_sha256,
         source_fixture_sha256="c" * 64,
         snapshot_sha256="d" * 64,
         source_schema_revision=1,
@@ -130,7 +127,11 @@ def _payload() -> BenchmarkPassPayloadV1:
     )
     return BenchmarkPassPayloadV1(
         schema_version=1,
-        resolved_manifest=_manifest(),
+        resolved_manifest=_manifest(
+            cases_sha256=sha256_hex(
+                b"".join(canonical_json_bytes(case.case) + b"\n" for case in cases)
+            )
+        ),
         cases=cases,
         comparison_complete=True,
         safety=BenchmarkSafetyEvidenceV1(
@@ -186,7 +187,7 @@ def test_benchmark_reports_are_canonical_and_summary_binds_evidence_hash() -> No
 
     assert (
         sha256_hex(pass_body)
-        == "f218193c00f26830e3e5f93f2b086694258582a9ed75d991a2e3e22223deddbf"
+        == "8e68ca375695a8b8e571d8dec70253f9b9e43e9f1b2acb41ed1de3c6c28a0bac"
     )
     assert verify_benchmark_evidence_bytes(evidence_body) == report
     assert (
@@ -287,6 +288,78 @@ def test_benchmark_evidence_rejects_coherently_rederived_oracle_tampering() -> N
     BenchmarkEvidenceReportV1.model_validate_json(tampered, strict=True)
     with pytest.raises(ExperimentOutputError, match="oracle evidence"):
         verify_benchmark_evidence_bytes(tampered)
+
+
+def _rederived_rubric_tampered_report() -> BenchmarkEvidenceReportV1:
+    original = _report()
+    altered_cases: list[BenchmarkCaseEvidenceV1] = []
+    for evidence_case in original.data.pass_payload.cases:
+        document = evidence_case.case.model_dump(mode="json")
+        document["required"][0]["label"] = "queue-forbidden"
+        document["forbidden"][0]["label"] = "queue-required"
+        document["checkpoints"][0]["labels"] = ["queue-forbidden"]
+        rubric = BenchmarkCaseV1.model_validate_json(canonical_json_bytes(document))
+        arms = tuple(
+            arm.model_copy(
+                update={
+                    "oracle": score_benchmark_observation(rubric, arm.observation)
+                }
+            )
+            for arm in evidence_case.arms
+            if arm.observation is not None
+        )
+        altered_cases.append(derive_case_comparison(rubric, arms))
+    cases = tuple(altered_cases)
+    payload = original.data.pass_payload.model_copy(
+        update={"cases": cases, "aggregate": aggregate_benchmark_cases(cases)}
+    )
+    return BenchmarkEvidenceReportV1(
+        data=BenchmarkEvidenceDataV1(
+            schema_version=1,
+            pass_payload=payload,
+            deterministic_replay_match=True,
+            gates=evaluate_pilot_gates(payload, payload),
+            expansion_gate_passed=all(
+                gate.passed for gate in evaluate_pilot_gates(payload, payload)
+            ),
+            valid=True,
+        )
+    )
+
+
+def test_benchmark_evidence_rejects_rederived_rubrics_without_manifest_hash_change(
+) -> None:
+    forged = _rederived_rubric_tampered_report()
+    body = canonical_json_bytes(forged)
+
+    with pytest.raises(ExperimentOutputError, match="cases"):
+        canonical_benchmark_evidence_bytes(forged)
+    with pytest.raises(ExperimentOutputError, match="cases"):
+        verify_benchmark_evidence_bytes(body)
+
+
+def test_benchmark_evidence_rejects_embedded_case_order_changes() -> None:
+    original = _report()
+    cases = tuple(reversed(original.data.pass_payload.cases))
+    payload = original.data.pass_payload.model_copy(
+        update={"cases": cases, "aggregate": aggregate_benchmark_cases(cases)}
+    )
+    reordered = BenchmarkEvidenceReportV1(
+        data=BenchmarkEvidenceDataV1(
+            schema_version=1,
+            pass_payload=payload,
+            deterministic_replay_match=True,
+            gates=evaluate_pilot_gates(payload, payload),
+            expansion_gate_passed=True,
+            valid=True,
+        )
+    )
+    body = canonical_json_bytes(reordered)
+
+    with pytest.raises(ExperimentOutputError, match="cases"):
+        canonical_benchmark_evidence_bytes(reordered)
+    with pytest.raises(ExperimentOutputError, match="cases"):
+        verify_benchmark_evidence_bytes(body)
 
 
 def test_incomplete_evidence_is_validly_encoded_but_not_valid() -> None:
@@ -442,6 +515,84 @@ def test_public_benchmark_encoders_reject_oversized_models_before_dump(
         assert captured.value.code == "output_too_large"
 
 
+def test_public_profile_encoder_rejects_a_cycle_before_unbounded_preflight(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class CountingCycle(list[object]):
+        visits = 0
+
+        def __iter__(self) -> object:
+            self.visits += 1
+            if self.visits > 8:
+                raise AssertionError("preflight revisited cyclic list")
+            return super().__iter__()
+
+    cycle = CountingCycle()
+    cycle.append(cycle)
+    profile = BenchmarkProfileReportV1.model_construct(
+        data=BenchmarkProfileDataV1.model_construct(
+            schema_version=1,
+            pack_id=cycle,
+            profile_complete=True,
+            wall_duration_ns=25,
+            database_bytes=4096,
+            clone_count=240,
+            fts5_available=True,
+        )
+    )
+
+    def unexpected_dump(*args: object, **kwargs: object) -> object:
+        raise AssertionError("cyclic output reached model_dump")
+
+    monkeypatch.setattr(BenchmarkProfileReportV1, "model_dump", unexpected_dump)
+    with pytest.raises(ExperimentOutputError) as captured:
+        canonical_benchmark_profile_bytes(profile)
+
+    assert captured.value.code == "invalid_benchmark_profile"
+    assert cycle.visits == 1
+
+
+def test_preflight_keeps_repeated_noncyclic_model_aliases_distinct(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    shared = BenchmarkProfileDataV1.model_construct(
+        schema_version=1,
+        pack_id="experiencebench-s-pilot",
+        profile_complete=True,
+        wall_duration_ns=25,
+        database_bytes=4096,
+        clone_count=240,
+        fts5_available=True,
+    )
+    profile = BenchmarkProfileReportV1.model_construct(
+        data=BenchmarkProfileDataV1.model_construct(
+            schema_version=1,
+            pack_id=(shared, shared),
+            profile_complete=True,
+            wall_duration_ns=25,
+            database_bytes=4096,
+            clone_count=240,
+            fts5_available=True,
+        )
+    )
+    calls = 0
+    real_dump = BenchmarkProfileReportV1.model_dump
+
+    def record_dump(
+        self: BenchmarkProfileReportV1, *args: object, **kwargs: object
+    ) -> object:
+        nonlocal calls
+        calls += 1
+        return real_dump(self, *args, **kwargs)
+
+    monkeypatch.setattr(BenchmarkProfileReportV1, "model_dump", record_dump)
+    with pytest.raises(ExperimentOutputError) as captured:
+        canonical_benchmark_profile_bytes(profile)
+
+    assert captured.value.code == "invalid_benchmark_profile"
+    assert calls == 1
+
+
 def test_benchmark_artifacts_keep_profile_separate_and_write_exact_paths(
     tmp_path: Path,
 ) -> None:
@@ -495,86 +646,22 @@ def test_omitted_or_failed_profile_cannot_change_evidence_or_expansion_gate(
     assert without_profile.evidence_body == with_profile.evidence_body
     assert without_profile.summary_body == with_profile.summary_body
 
-    replaced = write_benchmark_artifacts(
-        first_workspace, evidence=_report(), profile=None
-    )
-    assert replaced.profile_path is None
-    assert not (first_workspace.root / "artifacts/profile.json").exists()
-    assert replaced.evidence_body == with_profile.evidence_body
-    assert replaced.summary_body == with_profile.summary_body
-
-
-@pytest.mark.parametrize("failure_position", (1, 2, 3))
-def test_benchmark_artifact_set_rolls_back_each_publish_failure(
-    failure_position: int, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    workspace = prepare_owned_workspace(
-        tmp_path / "workspace",
-        policy=REPLAY_WORKSPACE_POLICY,
-        replace_owned=False,
-        allow_unmarked_empty=True,
-    )
-
-    previous = write_benchmark_artifacts(
-        workspace, evidence=_report(), profile=_profile()
-    )
     previous_entries = {
         path: (path.read_bytes(), path.stat().st_ino)
         for path in (
-            previous.evidence_path,
-            previous.summary_path,
-            previous.profile_path,
+            with_profile.evidence_path,
+            with_profile.summary_path,
+            with_profile.profile_path,
         )
         if path is not None
     }
-    commits = 0
-    real_commit = workspace_module._commit_temporary
-
-    def fail_commit(*args: object, **kwargs: object) -> None:
-        nonlocal commits
-        commits += 1
-        if commits == failure_position:
-            raise OSError("/private/write-failure")
-        real_commit(*args, **kwargs)
-
-    monkeypatch.setattr(workspace_module, "_commit_temporary", fail_commit)
     with pytest.raises(ExperimentOutputError) as captured:
-        write_benchmark_artifacts(
-            workspace,
-            evidence=_report().model_copy(
-                update={
-                    "data": _report().data.model_copy(
-                        update={
-                            "pass_payload": _payload().model_copy(
-                                update={
-                                    "resolved_manifest": _manifest().model_copy(
-                                        update={"seed": 20260821}
-                                    )
-                                }
-                            )
-                        }
-                    )
-                }
-            ),
-            profile=_profile().model_copy(
-                update={
-                    "data": _profile().data.model_copy(
-                        update={"wall_duration_ns": 26}
-                    )
-                }
-            ),
-        )
+        write_benchmark_artifacts(first_workspace, evidence=_report(), profile=None)
 
     assert captured.value.code == "artifact_write_failed"
-    assert "/private/write-failure" not in str(captured.value)
     assert {
         path: (path.read_bytes(), path.stat().st_ino) for path in previous_entries
     } == previous_entries
-    assert not [
-        path
-        for path in (workspace.root / "artifacts").iterdir()
-        if path.name.endswith(".tmp") or path.name.endswith(".backup")
-    ]
 
 
 def test_profile_serialization_failure_retains_the_previous_artifact_set(
