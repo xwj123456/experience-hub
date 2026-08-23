@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from collections import Counter
 from copy import deepcopy
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -21,8 +23,12 @@ from experience_hub.experiments.benchmarks.contracts import (
     BENCHMARK_ARM_ORDER,
     MAX_BENCHMARK_INPUT_BYTES,
     MAX_BENCHMARK_TOTAL_INPUT_BYTES,
+    BenchmarkSourceExperienceV1,
 )
-from experience_hub.experiments.benchmarks.loading import load_benchmark_pack
+from experience_hub.experiments.benchmarks.loading import (
+    LoadedBenchmarkPack,
+    load_benchmark_pack,
+)
 from experience_hub.experiments.errors import ExperimentInputError
 
 REPOSITORY_ROOT = Path(__file__).parents[2]
@@ -107,6 +113,127 @@ REVIEWED_ABSTRACTIONS = frozenset(
         "distractor-mix-keyword-collision",
     }
 )
+EXPECTED_CASES_SHA256 = (
+    "827ae76eef7c9a17925c5fd9a358f7a8117ab36126a23a05f2fdb6cffb9acda2"
+)
+EXPECTED_SOURCE_SHA256 = (
+    "85c02a96972623132988e9112e9743911c89e0e169417dccb07675df9d5a78b8"
+)
+EXPECTED_MANIFEST_SHA256 = (
+    "4f403ad87b649c722c28ac2fefe537526efd385d00c16e3293da65e1c771b606"
+)
+_ROLE_MARKERS = (
+    "Required decision step",
+    "Supporting context only",
+    "Superseded state lacks the current decision mechanism",
+    "Lexical overlap lacks the declared mechanism boundary",
+    "This shortcut violates the required safety boundary",
+)
+_PUBLIC_TEXT_PATTERNS = (
+    re.compile(rb"(?:^|[\s\"'])/(?:Users|home|private|tmp|var|opt|Volumes)/"),
+    re.compile(rb"(?:^|[\s\"'])[A-Za-z]:[\\/]"),
+    re.compile(rb"\b[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"),
+    re.compile(
+        rb"\b(?:api[_ -]?key|access[_ -]?token|credential|password|secret|"
+        rb"private[_ -]?key|account|username)\s*[:=]",
+        re.IGNORECASE,
+    ),
+    re.compile(rb"-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----"),
+    re.compile(rb"(?:Authorization[ \t]*:[ \t]*)?Bearer[ \t]+\S{16,}", re.I),
+    re.compile(rb"(?<!\d)1[3-9]\d{9}(?!\d)"),
+    re.compile(rb"(?<!\w)\+\d{1,3}[ -](?:\d[ -]?){8,}\d(?!\w)"),
+    re.compile(rb"https?://", re.IGNORECASE),
+    re.compile(rb"\b(?:localhost|127\.0\.0\.1)(?::\d{2,5})?\b", re.I),
+)
+_PROHIBITED_PUBLIC_TOKENS = tuple(
+    "".join(parts).encode()
+    for parts in (
+        ("co", "dex"),
+        ("super", "power"),
+        ("open", "ai"),
+        ("chat", "gpt"),
+        ("anthro", "pic"),
+        ("cla", "ude"),
+        ("gem", "ini"),
+        ("copi", "lot"),
+        (".", "super", "powers"),
+        ("private", "-docs"),
+        ("private", " ledger"),
+        ("internal", " plan"),
+        ("execution", " plan"),
+        ("task-", "9-report"),
+        ("case-", "review"),
+    )
+)
+
+
+def _assert_frozen_identity(loaded: LoadedBenchmarkPack) -> None:
+    assert sha256_hex(loaded.cases_body) == EXPECTED_CASES_SHA256
+    assert sha256_hex(loaded.source_body) == EXPECTED_SOURCE_SHA256
+    assert sha256_hex(loaded.manifest_body) == EXPECTED_MANIFEST_SHA256
+
+
+def _role_for_label(case_id: str, label: str) -> str:
+    for role in ("required", "optional", "forbidden", "stale", "misleading"):
+        if label.startswith(f"{case_id}-{role}-"):
+            return role
+    raise AssertionError("case source label does not declare a rubric role")
+
+
+def _assert_role_neutral_public_source(loaded: LoadedBenchmarkPack) -> None:
+    experiences = {
+        record.label: record
+        for record in loaded.source
+        if isinstance(record, BenchmarkSourceExperienceV1)
+    }
+    searchable = tuple(experiences.values())
+    joined_searchable = "\n".join(
+        "\n".join(
+            (
+                record.body,
+                record.summary,
+                record.mechanism,
+                *record.tags,
+                *record.applicability,
+            )
+        )
+        for record in searchable
+    )
+    assert all(marker not in joined_searchable for marker in _ROLE_MARKERS)
+    assert all(record.body != record.summary for record in searchable)
+    assert len({record.mechanism for record in searchable}) == len(searchable)
+    assert len({record.applicability for record in searchable}) >= 30
+
+    roles_by_profile: dict[tuple[str, int, int], set[str]] = {}
+    positions_by_role: dict[str, set[int]] = {
+        role: set()
+        for role in ("required", "optional", "forbidden", "stale", "misleading")
+    }
+    for case in loaded.cases:
+        semantic = tuple(experiences[label] for label in case.source_labels)
+        ordered = tuple(sorted(semantic, key=lambda record: record.created_at))
+        cue_template = " ".join(case.mechanism_cues).casefold()
+        for position, record in enumerate(ordered):
+            role = _role_for_label(case.case_id, record.label)
+            assert not record.mechanism.casefold().startswith(cue_template)
+            if record.temperature.value != "archived":
+                profile = (
+                    record.temperature.value,
+                    record.importance_micros,
+                    record.confidence_micros,
+                )
+                roles_by_profile.setdefault(profile, set()).add(role)
+            positions_by_role[role].add(position)
+    expected_roles = {"required", "optional", "forbidden", "stale", "misleading"}
+    assert all(roles == expected_roles for roles in roles_by_profile.values())
+    assert all(len(positions) >= 4 for positions in positions_by_role.values())
+
+
+def _assert_public_artifacts_private_safe(bodies: tuple[bytes, ...]) -> None:
+    for body in bodies:
+        lowered = body.lower()
+        assert all(pattern.search(body) is None for pattern in _PUBLIC_TEXT_PATTERNS)
+        assert all(token not in lowered for token in _PROHIBITED_PUBLIC_TOKENS)
 
 
 def _jsonl(records: list[dict[str, object]]) -> bytes:
@@ -536,8 +663,9 @@ def test_committed_pilot_pack_has_exact_reviewed_composition_and_privacy() -> No
         manifest.summary_schema_version,
         manifest.profile_schema_version,
     ) == (1, 1, 1, 1, 1, 1, 1)
-    assert sha256_hex(loaded.cases_body) == manifest.cases.sha256
-    assert sha256_hex(loaded.source_body) == manifest.source.sha256
+    _assert_frozen_identity(loaded)
+    assert manifest.cases.sha256 == EXPECTED_CASES_SHA256
+    assert manifest.source.sha256 == EXPECTED_SOURCE_SHA256
     manifest_document = json.loads(loaded.manifest_body)
     assert canonical_json_bytes(manifest_document) == loaded.manifest_body
     assert all(
@@ -598,14 +726,90 @@ def test_committed_pilot_pack_has_exact_reviewed_composition_and_privacy() -> No
     assert archived.owner_label == archived_case.owner_label
     assert archived.temperature.value == "archived"
 
+    _assert_role_neutral_public_source(loaded)
     public_bodies = (
         loaded.manifest_body,
         loaded.cases_body,
         loaded.source_body,
         (PILOT_MANIFEST.parent / "README.md").read_bytes(),
     )
-    for body in public_bodies:
-        assert b"/Users/" not in body
-        assert b"C:\\Users\\" not in body
-        assert b"@" not in body
-        assert b"-----BEGIN " not in body
+    _assert_public_artifacts_private_safe(public_bodies)
+
+
+def test_frozen_identity_rejects_a_coherent_source_and_manifest_rewrite(
+    tmp_path: Path,
+) -> None:
+    source_documents = [
+        json.loads(line)
+        for line in PILOT_MANIFEST.with_name("pilot-source.jsonl")
+        .read_bytes()
+        .rstrip(b"\n")
+        .splitlines()
+    ]
+    source_documents[31]["summary"] += " Revised after the freeze."
+    source_body = _jsonl(source_documents)
+    manifest_document = json.loads(PILOT_MANIFEST.read_bytes())
+    manifest_document["source"]["sha256"] = sha256_hex(source_body)
+    (tmp_path / "pilot-cases.jsonl").write_bytes(
+        PILOT_MANIFEST.with_name("pilot-cases.jsonl").read_bytes()
+    )
+    (tmp_path / "pilot-source.jsonl").write_bytes(source_body)
+    manifest_path = tmp_path / "pilot-manifest.json"
+    manifest_path.write_bytes(canonical_json_bytes(manifest_document))
+
+    coherently_rewritten = load_benchmark_pack(manifest_path)
+
+    with pytest.raises(AssertionError):
+        _assert_frozen_identity(coherently_rewritten)
+
+
+def test_role_neutrality_rejects_exact_cues_and_category_template() -> None:
+    loaded = load_benchmark_pack(PILOT_MANIFEST)
+    case = loaded.cases[0]
+    target_label = f"{case.case_id}-misleading-1"
+    mutated_source = tuple(
+        record.model_copy(
+            update={
+                "mechanism": (
+                    f"{' '.join(case.mechanism_cues)}. Required decision step 1."
+                )
+            }
+        )
+        if record.label == target_label
+        else record
+        for record in loaded.source
+    )
+
+    with pytest.raises(AssertionError):
+        _assert_role_neutral_public_source(replace(loaded, source=mutated_source))
+
+
+@pytest.mark.parametrize(
+    "sentinel",
+    (
+        b"/" + b"Users/private/work",
+        b"C:" + b"\\private\\work",
+        b"operator" + b"@example.test",
+        b"account" + b"=private-user",
+        b"credential" + b"=not-public",
+        b"api_key" + b"=not-public",
+        b"access_token" + b"=not-public",
+        b"password" + b"=not-public",
+        b"secret" + b"=not-public",
+        b"private_key" + b"=not-public",
+        b"-----BEGIN " + b"PRIVATE KEY-----",
+        b"Bearer " + b"x" * 16,
+        b"138" + b"00138000",
+        b"+86 " + b"138 0013 8000",
+        b"internal" + b" plan marker",
+        b"private" + b" ledger marker",
+        b"https" + b"://private.example.test/service",
+        b"local" + b"host:8000",
+        *_PROHIBITED_PUBLIC_TOKENS,
+    ),
+)
+def test_public_artifact_scanner_rejects_each_private_class(
+    sentinel: bytes,
+) -> None:
+    with pytest.raises(AssertionError):
+        _assert_public_artifacts_private_safe((b"public prefix " + sentinel,))
