@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from importlib import import_module
 from pathlib import Path
 from typing import Any, cast
@@ -74,6 +75,35 @@ def test_replay_help_exposes_inspect_run_and_verify() -> None:
 
     assert result.exit_code == 0, result.output
     assert {"inspect", "run", "verify"} <= set(unstyle(result.output).split())
+
+
+@pytest.mark.parametrize(
+    ("command", "expected_options"),
+    (
+        ("inspect", {"--database", "--help", "--manifest"}),
+        (
+            "run",
+            {
+                "--database",
+                "--help",
+                "--manifest",
+                "--replace-owned",
+                "--workspace",
+            },
+        ),
+        ("verify", {"--help", "--report"}),
+    ),
+)
+def test_replay_subcommand_options_remain_exact(
+    command: str,
+    expected_options: set[str],
+) -> None:
+    result = RUNNER.invoke(app, ["replay", command, "--help"])
+
+    assert result.exit_code == 0, result.output
+    assert set(re.findall(r"--[a-z][a-z-]*", unstyle(result.output))) == (
+        expected_options
+    )
 
 
 def test_committed_smoke_fixture_is_exact_and_canonical() -> None:

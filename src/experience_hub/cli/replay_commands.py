@@ -9,6 +9,7 @@ from typing import Annotated, Any, NoReturn
 
 import typer
 
+from experience_hub.cli.benchmark_commands import benchmark_app
 from experience_hub.experiments import (
     ExperimentInputError,
     ExperimentIsolationError,
@@ -26,6 +27,7 @@ replay_app = typer.Typer(
     no_args_is_help=True,
     add_completion=False,
 )
+replay_app.add_typer(benchmark_app, name="benchmark")
 
 
 def _error_document(error: BaseException) -> dict[str, Any]:
