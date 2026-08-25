@@ -189,6 +189,7 @@ def test_build_artifacts_exclude_private_files_and_retain_public_contracts(
         ),
     )
     sentinels = (
+        ".private-tool/local-plan.md",
         ".data/private.sqlite3",
         ".internal/internal-review.md",
         ".worktrees/private-worktree.txt",
@@ -279,10 +280,11 @@ def test_build_artifacts_exclude_private_files_and_retain_public_contracts(
 
     def leaked(paths: tuple[str, ...]) -> tuple[str, ...]:
         return tuple(
-            path
-            for path in paths
-            if path in forbidden_names
-            or path.startswith(forbidden_prefixes)
+                path
+                for path in paths
+                if path in forbidden_names
+                or path.startswith(".")
+                or path.startswith(forbidden_prefixes)
             or path.startswith(".coverage.")
             or path.endswith((".db", ".sqlite", ".sqlite3"))
         )

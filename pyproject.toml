@@ -24,6 +24,7 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build]
 exclude = [
+    "/.*",
     "/.cache",
     "/.coverage*",
     "/.data",
