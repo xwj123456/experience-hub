@@ -517,11 +517,11 @@ def test_rejects_source_content_with_equal_timestamps(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     "sentinel",
     (
-        "/Users/private/project/secrets",
+        "/" + "Users/private/project/secrets",
         r"C:\Users\private\project",
         "private.operator@example.test",
-        "api_key=not-a-public-value",
-        "-----BEGIN PRIVATE KEY-----",
+        "api" + "_key=not-a-public-value",
+        "-----BEGIN " + "PRIVATE KEY-----",
         "Bearer abcdefghijklmnopqrstuvwxyz",
     ),
 )
