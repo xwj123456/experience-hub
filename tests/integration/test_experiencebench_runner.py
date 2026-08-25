@@ -961,6 +961,19 @@ async def test_full_runner_publishes_two_real_thirty_case_four_arm_passes(
     )
     assert _tree_bytes(artifacts) == artifacts_before_verification
 
+    public_evidence = tmp_path / "experiencebench-s-pilot"
+    public_evidence.mkdir()
+    (public_evidence / "benchmark-evidence.json").write_bytes(
+        execution.evidence_body
+    )
+    (public_evidence / "benchmark-summary.json").write_bytes(
+        execution.summary_body
+    )
+    assert (
+        verify_benchmark_report(public_evidence / "benchmark-evidence.json")
+        == execution.evidence
+    )
+
     unexpected = artifacts / "unexpected.txt"
     unexpected.write_text("retain", encoding="utf-8")
     with pytest.raises(ExperimentOutputError) as unknown_entry:

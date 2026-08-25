@@ -87,6 +87,7 @@ _SCHEMA_REVISION = re.compile(r"0*(\d+)(?:_[a-z0-9_]+)?\Z")
 _REPORT_NAME = "benchmark-evidence.json"
 _SUMMARY_NAME = "benchmark-summary.json"
 _PROFILE_NAME = "profile.json"
+_REPORT_DIRECTORY_NAMES = frozenset({"artifacts", "experiencebench-s-pilot"})
 _MAX_PROFILE_CLOCK_NS = (1 << 63) - 1
 _DIRECTORY_FLAGS = (
     os.O_RDONLY
@@ -1107,7 +1108,10 @@ def verify_benchmark_report(path: Path) -> BenchmarkEvidenceReportV1:
     if not isinstance(path, Path):
         raise _report_path_error()
     absolute = Path(os.path.abspath(path))
-    if absolute.name != _REPORT_NAME or absolute.parent.name != "artifacts":
+    if (
+        absolute.name != _REPORT_NAME
+        or absolute.parent.name not in _REPORT_DIRECTORY_NAMES
+    ):
         raise _report_path_error()
     parent_fd = -1
     try:
