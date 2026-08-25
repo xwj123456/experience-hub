@@ -294,10 +294,11 @@ class CandidateSelection:
 
 @dataclass(frozen=True, slots=True)
 class RetrievalCandidate:
-    """A selected active experience and all current terms used for ranking."""
+    """A selected active experience with recall and field-aware ranking terms."""
 
     record: RetrievalRecord
     terms: tuple[TermCue, ...]
+    ranking_terms: tuple[TermCue, ...]
     raw_overlap: float
 
     def __post_init__(self) -> None:
@@ -306,6 +307,11 @@ class RetrievalCandidate:
         if self.record.state.temperature is Temperature.ARCHIVED:
             raise ValueError("Retrieval candidates cannot be archived")
         _immutable_terms("terms", self.terms, allow_empty=False)
+        _immutable_terms(
+            "ranking_terms",
+            self.ranking_terms,
+            allow_empty=False,
+        )
         if (
             isinstance(self.raw_overlap, bool)
             or not isinstance(self.raw_overlap, (int, float))

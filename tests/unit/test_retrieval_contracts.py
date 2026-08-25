@@ -180,6 +180,7 @@ def test_retrieval_record_rejects_coercion_and_mutable_sequences(
 
 def test_candidate_values_require_cues_overlap_and_active_state() -> None:
     cue = TermCue(term="memory", term_kind="word", weight=1.0)
+    ranking_cue = TermCue(term="lease", term_kind="mechanism", weight=1.25)
     selection = CandidateSelection(
         owner_agent_id=OWNER_ID,
         query_cues=(cue,),
@@ -189,10 +190,12 @@ def test_candidate_values_require_cues_overlap_and_active_state() -> None:
     candidate = RetrievalCandidate(
         record=record(),
         terms=(cue,),
+        ranking_terms=(ranking_cue,),
         raw_overlap=1.0,
     )
 
     assert selection.query_cues == (cue,)
+    assert candidate.ranking_terms == (ranking_cue,)
     assert candidate.raw_overlap == 1.0
     with pytest.raises(ValueError, match="must not be empty"):
         CandidateSelection(
@@ -202,11 +205,17 @@ def test_candidate_values_require_cues_overlap_and_active_state() -> None:
             requested_limit=10,
         )
     with pytest.raises(ValueError, match="positive"):
-        RetrievalCandidate(record=record(), terms=(cue,), raw_overlap=0.0)
+        RetrievalCandidate(
+            record=record(),
+            terms=(cue,),
+            ranking_terms=(ranking_cue,),
+            raw_overlap=0.0,
+        )
     with pytest.raises(ValueError, match="archived"):
         RetrievalCandidate(
             record=record(temperature=Temperature.ARCHIVED),
             terms=(cue,),
+            ranking_terms=(ranking_cue,),
             raw_overlap=1.0,
         )
 

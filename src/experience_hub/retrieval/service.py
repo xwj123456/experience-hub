@@ -41,12 +41,13 @@ from experience_hub.retrieval.contracts import (
     SearchResult,
 )
 from experience_hub.retrieval.ranking import (
-    RankedCandidate,
     RankingCandidate,
     RetrievalMode,
     rank_candidates,
+    relevance_components,
+    retain_relevance_window,
 )
-from experience_hub.retrieval.tokenizer import query_cues
+from experience_hub.retrieval.tokenizer import query_cues, ranking_query_cues
 from experience_hub.storage.unit_of_work import UnitOfWork
 
 FOCUSED_COLD_EXPANSION_THRESHOLD = 0.72
@@ -290,23 +291,16 @@ def _access_intent(
 
 
 def _cold_signal(
-    ranked: RankedCandidate,
     *,
     mode: RetrievalMode,
+    lexical_or_trigram_relevance: float,
+    mechanism_relevance: float,
 ) -> float | None:
     if mode is RetrievalMode.FOCUSED:
-        signal = ranked.lexical_or_trigram_relevance
-        return (
-            signal
-            if signal >= FOCUSED_COLD_EXPANSION_THRESHOLD
-            else None
-        )
-    signal = ranked.mechanism_relevance
-    return (
-        signal
-        if signal >= ASSOCIATIVE_COLD_EXPANSION_THRESHOLD
-        else None
-    )
+        signal = lexical_or_trigram_relevance
+        return signal if signal >= FOCUSED_COLD_EXPANSION_THRESHOLD else None
+    signal = mechanism_relevance
+    return signal if signal >= ASSOCIATIVE_COLD_EXPANSION_THRESHOLD else None
 
 
 def _utf8_prefix(value: str, maximum_bytes: int) -> str:
@@ -379,27 +373,50 @@ class _RetrievalPlanner:
         peek: bool,
     ) -> _RetrievalPlan:
         at = require_utc(at)
-        cues = query_cues(
+        recall_cues = query_cues(
             query.query,
             tags=query.tags,
             mechanisms=query.mechanism_cues,
         )
-        if not cues:
+        if not recall_cues:
             raise _empty_query()
+        ranking_cues = ranking_query_cues(
+            query.query,
+            tags=query.tags,
+            mechanisms=query.mechanism_cues,
+        )
         selected = await self._query.select_retrieval_candidates(
             session=session,
             selection=CandidateSelection(
                 owner_agent_id=query.owner_agent_id,
-                query_cues=cues,
+                query_cues=recall_cues,
                 mode=query.mode,
                 requested_limit=query.limit,
             ),
         )
-        by_id = {
-            candidate.record.experience_id: candidate
-            for candidate in selected
-        }
-        ranked = rank_candidates(
+        by_id = {candidate.record.experience_id: candidate for candidate in selected}
+        active_ranked = rank_candidates(
+            (
+                RankingCandidate(
+                    experience_id=candidate.record.experience_id,
+                    temperature=candidate.record.state.temperature,
+                    current_version_created_at=(
+                        candidate.record.current_version_created_at
+                    ),
+                    terms=candidate.ranking_terms,
+                    activation_inputs=_activation_inputs(candidate.record),
+                    source_trust=candidate.record.state.source_trust,
+                )
+                for candidate in selected
+                if candidate.record.state.temperature is not Temperature.COLD
+            ),
+            query_cues=ranking_cues,
+            mode=query.mode,
+            at=at,
+            lifecycle_config=self._lifecycle_config,
+            field_aware=True,
+        )
+        cold_ranked = rank_candidates(
             (
                 RankingCandidate(
                     experience_id=candidate.record.experience_id,
@@ -412,17 +429,28 @@ class _RetrievalPlanner:
                     source_trust=candidate.record.state.source_trust,
                 )
                 for candidate in selected
+                if candidate.record.state.temperature is Temperature.COLD
             ),
-            query_cues=cues,
+            query_cues=recall_cues,
             mode=query.mode,
             at=at,
             lifecycle_config=self._lifecycle_config,
-        )[: query.limit]
+        )
+        ranked = retain_relevance_window(
+            (*active_ranked, *cold_ranked),
+            requested_limit=query.limit,
+        )
 
         potential: list[UUID] = []
         signals: dict[UUID, float] = {}
         for value in ranked:
-            record = by_id[value.experience_id].record
+            candidate = by_id[value.experience_id]
+            record = candidate.record
+            recall = relevance_components(
+                recall_cues,
+                candidate.terms,
+                query.mode,
+            )
             if record.state.temperature in {
                 Temperature.HOT,
                 Temperature.WARM,
@@ -431,7 +459,18 @@ class _RetrievalPlanner:
             elif (
                 record.state.temperature is Temperature.COLD
                 and query.expand_cold
-                and (signal := _cold_signal(value, mode=query.mode))
+                and (
+                    signal := _cold_signal(
+                        mode=query.mode,
+                        lexical_or_trigram_relevance=(
+                            max(
+                                recall.word_tag_coverage,
+                                recall.trigram_coverage,
+                            )
+                        ),
+                        mechanism_relevance=recall.mechanism_relevance,
+                    )
+                )
                 is not None
             ):
                 potential.append(record.current_version_id)
@@ -505,9 +544,7 @@ class _RetrievalPlanner:
                     )
                     intents.append(intent)
                     state = intent.resulting_state
-                    reactivated = (
-                        record.state.temperature is Temperature.COLD
-                    )
+                    reactivated = record.state.temperature is Temperature.COLD
             hits.append(
                 SearchHit(
                     experience=_view(
@@ -518,9 +555,7 @@ class _RetrievalPlanner:
                     ),
                     score=value.score,
                     ranking_relevance=value.ranking_relevance,
-                    lexical_or_trigram_relevance=(
-                        value.lexical_or_trigram_relevance
-                    ),
+                    lexical_or_trigram_relevance=(value.lexical_or_trigram_relevance),
                     mechanism_relevance=value.mechanism_relevance,
                     activation=value.activation,
                     expanded=body is not None,

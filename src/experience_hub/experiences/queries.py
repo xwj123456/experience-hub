@@ -37,7 +37,7 @@ from experience_hub.retrieval.ranking import (
     select_temperature_pools,
     temperature_pool_quota,
 )
-from experience_hub.retrieval.tokenizer import TermCue
+from experience_hub.retrieval.tokenizer import TermCue, ranking_version_terms
 from experience_hub.storage.tables import (
     DomainEventRow,
     ExperiencePayloadRow,
@@ -549,6 +549,10 @@ class ExperienceQuery:
                 values[experience_id] = RetrievalCandidate(
                     record=record,
                     terms=tuple(terms),
+                    ranking_terms=ranking_version_terms(
+                        record,
+                        recall_terms=tuple(terms),
+                    ),
                     raw_overlap=overlaps[experience_id],
                 )
             return tuple(values[experience_id] for experience_id in selected_ids)

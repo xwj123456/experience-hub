@@ -162,14 +162,14 @@ access_strength := min(20, S(t) + 1)
 
 ### Cue and candidate selection
 
-文本先做 Unicode NFKC 规范化。Latin/mixed 文本形成 word cues，所有脚本形成 padded character trigrams；tag 与 mechanism 另有独立 cue kind。候选按 hot、warm、cold 三个温度池分别限额，archived 不入池：
+文本先做 Unicode NFKC 规范化。稳定 recall projection 使用 Latin word cues 和所有脚本的 padded character trigrams；tag 与 mechanism 另有独立 cue kind。热/温记忆进入最终排序时，还会使用固定版本本地词典生成中文词，并按 summary、mechanism、tag 和 applicability 的字段来源赋权。正文 projection 只作为弱 fallback，不需要在排序前解码正文。候选按 hot、warm、cold 三个温度池分别限额，archived 不入池：
 
 | Mode | hot | warm | cold |
 |---|---:|---:|---:|
 | `focused` | `max(10, 4*limit)` | `max(10, 4*limit)` | `max(10, 2*limit)` |
 | `associative` | `max(10, 3*limit)` | `max(10, 3*limit)` | `max(10, 5*limit)` |
 
-focused 使用 lexical/trigram relevance，最低 `0.05`；associative 使用 `max(lexical, 0.80*mechanism + 0.20*lexical)`，lexical 或 mechanism 至少 `0.02`。
+稳定 recall admission 中，focused 使用 lexical/trigram relevance，最低 `0.05`；associative 使用 `max(lexical, 0.80*mechanism + 0.20*lexical)`，lexical 或 mechanism 至少 `0.02`。cold 始终保留这套稳定 recall 分数和展开阈值，避免字段降权改变既有 reactivation 语义。
 
 ### Ranking
 
@@ -185,6 +185,8 @@ score =
 ```
 
 排序依次使用 score、relevance、当前版本时间和 UUID bytes 作为确定性 tie-breaker。
+
+热/温候选的 field-aware lexical relevance 在 word/tag 与 trigram 两个查询族都存在时使用 `0.60*word_tag + 0.40*trigram`；只有一个查询族时使用该族本身。focused 查询显式带 mechanism cue 时使用 `0.60*lexical + 0.40*mechanism`，否则保持 lexical；associative 仍使用 `max(lexical, 0.80*mechanism + 0.20*lexical)`。最终只保留 relevance 不低于最强候选 `85%` 的结果，再应用请求 limit，避免用弱相关项填满窗口。
 
 ### Blurred recall and cold reactivation
 

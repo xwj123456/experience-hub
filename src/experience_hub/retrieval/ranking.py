@@ -21,6 +21,7 @@ from experience_hub.retrieval.tokenizer import TermCue, TermKind
 FOCUSED_RELEVANCE_THRESHOLD = 0.05
 ASSOCIATIVE_RELEVANCE_THRESHOLD = 0.02
 MAX_RETRIEVAL_LIMIT = 50
+RELEVANCE_WINDOW_RATIO = 0.85
 
 _TERM_KINDS = frozenset({"word", "char_trigram", "tag", "mechanism"})
 _COMPATIBLE_KINDS: dict[str, frozenset[str]] = {
@@ -29,6 +30,11 @@ _COMPATIBLE_KINDS: dict[str, frozenset[str]] = {
     "mechanism": frozenset({"mechanism"}),
     "char_trigram": frozenset({"char_trigram"}),
 }
+
+_WORD_TAG_BLEND = 0.60
+_TRIGRAM_BLEND = 0.40
+_FOCUSED_LEXICAL_BLEND = 0.60
+_FOCUSED_MECHANISM_BLEND = 0.40
 
 
 class RetrievalMode(StrEnum):
@@ -120,9 +126,7 @@ def _query_cue_tuple(
     try:
         query = tuple(query_cues)
     except TypeError as error:
-        raise ValueError(
-            "query_cues must contain only TermCue values"
-        ) from error
+        raise ValueError("query_cues must contain only TermCue values") from error
     if not query:
         raise ValueError("query_cues must not be empty")
     if any(not isinstance(value, TermCue) for value in query):
@@ -318,8 +322,7 @@ def _matched_weight(
     return max(
         (
             weight
-            for (candidate_term, candidate_kind), weight
-            in candidate_weights.items()
+            for (candidate_term, candidate_kind), weight in candidate_weights.items()
             if candidate_term == term
             and candidate_kind in candidate_kinds
             and candidate_kind in _COMPATIBLE_KINDS[query_kind]
@@ -384,9 +387,7 @@ def coverage(
         if key[1] in included_query_kinds
     }
     ordered_query_weights = sorted(query_weights.items())
-    denominator = math.fsum(
-        query_weight for _, query_weight in ordered_query_weights
-    )
+    denominator = math.fsum(query_weight for _, query_weight in ordered_query_weights)
     if denominator == 0.0:
         return 0.0
     candidate_weights = _max_term_weights(
@@ -413,10 +414,40 @@ def relevance_components(
     candidate_terms: Iterable[TermCue],
     mode: RetrievalMode,
 ) -> RelevanceComponents:
-    """Compute all deterministic relevance components for one candidate."""
+    """Compute the stable recall relevance contract for one candidate."""
+    return _relevance_components(
+        query_cues,
+        candidate_terms,
+        mode,
+        field_aware=False,
+    )
+
+
+def field_relevance_components(
+    query_cues: Iterable[TermCue],
+    candidate_terms: Iterable[TermCue],
+    mode: RetrievalMode,
+) -> RelevanceComponents:
+    """Compute field-aware relevance used to rank active memories."""
+    return _relevance_components(
+        query_cues,
+        candidate_terms,
+        mode,
+        field_aware=True,
+    )
+
+
+def _relevance_components(
+    query_cues: Iterable[TermCue],
+    candidate_terms: Iterable[TermCue],
+    mode: RetrievalMode,
+    *,
+    field_aware: bool,
+) -> RelevanceComponents:
     selected_mode = _mode(mode)
     query = tuple(query_cues)
     candidate = tuple(candidate_terms)
+    query_kinds = {cue.term_kind for cue in query}
     word_tag = coverage(
         query,
         candidate,
@@ -427,14 +458,29 @@ def relevance_components(
         candidate,
         query_kinds=("char_trigram",),
     )
-    lexical = max(word_tag, trigram)
+    if (
+        field_aware
+        and query_kinds & {"word", "tag"}
+        and ("char_trigram" in query_kinds)
+    ):
+        lexical = _WORD_TAG_BLEND * word_tag + _TRIGRAM_BLEND * trigram
+    else:
+        lexical = max(word_tag, trigram)
     mechanism = coverage(
         query,
         candidate,
         query_kinds=("word", "mechanism"),
         candidate_kinds=("mechanism",),
     )
-    if selected_mode is RetrievalMode.FOCUSED:
+    if (
+        field_aware
+        and selected_mode is RetrievalMode.FOCUSED
+        and "mechanism" in query_kinds
+    ):
+        ranking = (
+            _FOCUSED_LEXICAL_BLEND * lexical + _FOCUSED_MECHANISM_BLEND * mechanism
+        )
+    elif selected_mode is RetrievalMode.FOCUSED:
         ranking = lexical
     else:
         ranking = max(lexical, 0.80 * mechanism + 0.20 * lexical)
@@ -504,8 +550,7 @@ def select_temperature_pools(
         (
             value
             for value in values
-            if value.raw_overlap > 0.0
-            and value.temperature is not Temperature.ARCHIVED
+            if value.raw_overlap > 0.0 and value.temperature is not Temperature.ARCHIVED
         ),
         key=lambda value: (-value.raw_overlap, value.experience_id.bytes),
     )
@@ -559,6 +604,7 @@ def rank_candidate(
     mode: RetrievalMode,
     at: datetime,
     lifecycle_config: LifecycleConfig,
+    field_aware: bool = False,
 ) -> RankedCandidate:
     """Rank one candidate using activation recomputed at the query clock."""
     if not isinstance(candidate, RankingCandidate):
@@ -568,10 +614,10 @@ def rank_candidate(
     if not isinstance(lifecycle_config, LifecycleConfig):
         raise ValueError("lifecycle_config must be LifecycleConfig")
     query_at = _timestamp("at", at)
-    relevance = relevance_components(
-        query,
-        candidate.terms,
-        selected_mode,
+    relevance = (
+        field_relevance_components(query, candidate.terms, selected_mode)
+        if field_aware
+        else relevance_components(query, candidate.terms, selected_mode)
     )
     activation = activation_at(
         candidate.activation_inputs,
@@ -593,9 +639,7 @@ def rank_candidate(
         current_version_created_at=candidate.current_version_created_at,
         score=score,
         ranking_relevance=relevance.ranking_relevance,
-        lexical_or_trigram_relevance=(
-            relevance.lexical_or_trigram_relevance
-        ),
+        lexical_or_trigram_relevance=(relevance.lexical_or_trigram_relevance),
         mechanism_relevance=relevance.mechanism_relevance,
         word_tag_coverage=relevance.word_tag_coverage,
         trigram_coverage=relevance.trigram_coverage,
@@ -612,9 +656,7 @@ def sort_ranked_candidates(
     """Sort by score, relevance, version time, then UUID bytes."""
     values = tuple(candidates)
     if any(not isinstance(value, RankedCandidate) for value in values):
-        raise ValueError(
-            "candidates must contain only RankedCandidate values"
-        )
+        raise ValueError("candidates must contain only RankedCandidate values")
     experience_ids = [value.experience_id for value in values]
     if len(experience_ids) != len(set(experience_ids)):
         raise ValueError("candidates must not repeat an experience_id")
@@ -629,6 +671,23 @@ def sort_ranked_candidates(
     return tuple(ordered)
 
 
+def retain_relevance_window(
+    candidates: Iterable[RankedCandidate],
+    *,
+    requested_limit: int,
+) -> tuple[RankedCandidate, ...]:
+    """Retain only candidates close to the strongest query-fit evidence."""
+    limit = _requested_limit(requested_limit)
+    ordered = sort_ranked_candidates(candidates)
+    if not ordered:
+        return ()
+    strongest = max(value.ranking_relevance for value in ordered)
+    minimum = RELEVANCE_WINDOW_RATIO * strongest
+    return tuple(value for value in ordered if value.ranking_relevance >= minimum)[
+        :limit
+    ]
+
+
 def rank_candidates(
     candidates: Iterable[RankingCandidate],
     *,
@@ -636,6 +695,7 @@ def rank_candidates(
     mode: RetrievalMode,
     at: datetime,
     lifecycle_config: LifecycleConfig,
+    field_aware: bool = False,
 ) -> tuple[RankedCandidate, ...]:
     """Rank non-archived candidates and discard those below mode threshold."""
     selected_mode = _mode(mode)
@@ -645,9 +705,7 @@ def rank_candidates(
         raise ValueError("lifecycle_config must be LifecycleConfig")
     values = tuple(candidates)
     if any(not isinstance(value, RankingCandidate) for value in values):
-        raise ValueError(
-            "candidates must contain only RankingCandidate values"
-        )
+        raise ValueError("candidates must contain only RankingCandidate values")
     experience_ids = [value.experience_id for value in values]
     if len(experience_ids) != len(set(experience_ids)):
         raise ValueError("candidates must not repeat an experience_id")
@@ -661,12 +719,11 @@ def rank_candidates(
             mode=selected_mode,
             at=query_at,
             lifecycle_config=lifecycle_config,
+            field_aware=field_aware,
         )
         if passes_relevance_threshold(
             mode=selected_mode,
-            lexical_or_trigram_relevance=(
-                value.lexical_or_trigram_relevance
-            ),
+            lexical_or_trigram_relevance=(value.lexical_or_trigram_relevance),
             mechanism_relevance=value.mechanism_relevance,
         ):
             ranked.append(value)
@@ -682,8 +739,10 @@ __all__ = [
     "RankingCandidate",
     "RelevanceComponents",
     "RetrievalMode",
+    "RELEVANCE_WINDOW_RATIO",
     "coverage",
     "cue_kinds_compatible",
+    "field_relevance_components",
     "final_score",
     "passes_relevance_threshold",
     "rank_candidate",
@@ -692,5 +751,6 @@ __all__ = [
     "relevance_components",
     "select_temperature_pools",
     "sort_ranked_candidates",
+    "retain_relevance_window",
     "temperature_pool_quota",
 ]

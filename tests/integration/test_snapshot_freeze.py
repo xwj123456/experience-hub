@@ -466,15 +466,14 @@ async def test_freeze_uses_one_session_without_access_or_quarantine_leakage(
     )
 
     by_source = {item.source_id: item for item in opted_in_snapshot.items}
-    assert first in by_source and second in by_source and blurred in by_source
+    assert first in by_source and second in by_source
+    assert blurred not in by_source
     assert 0 < len(by_source[first].excerpt.encode("utf-8")) <= (
         MAX_SNAPSHOT_EXCERPT_UTF8_BYTES
     )
     assert 0 < len(by_source[second].excerpt.encode("utf-8")) <= (
         MAX_SNAPSHOT_EXCERPT_UTF8_BYTES
     )
-    assert by_source[blurred].source_state is EvidenceSourceState.COLD
-    assert by_source[blurred].excerpt == ""
     assert len(snapshot_canonical_bytes(opted_in_snapshot.items)) <= (
         MAX_SNAPSHOT_UTF8_BYTES
     )

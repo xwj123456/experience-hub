@@ -9,6 +9,7 @@ from uuid import UUID
 
 import pytest
 
+import experience_hub.retrieval.ranking as ranking_module
 from experience_hub.experiences import Temperature
 from experience_hub.lifecycle import (
     ActivationInputs,
@@ -27,7 +28,6 @@ from experience_hub.retrieval.ranking import (
     rank_candidate,
     rank_candidates,
     raw_overlap,
-    relevance_components,
     select_temperature_pools,
     sort_ranked_candidates,
     temperature_pool_quota,
@@ -75,8 +75,7 @@ def test_cue_kind_compatibility_matrix(
     assert cue_kinds_compatible(query_kind, candidate_kind) is expected
 
 
-def test_raw_overlap_uses_exact_terms_and_max_compatible_weight_per_query_cue(
-) -> None:
+def test_raw_overlap_uses_exact_terms_and_max_compatible_weight_per_query_cue() -> None:
     query = (
         cue("cache", "word", 1.0),
         cue("cache", "word", 0.4),
@@ -164,8 +163,7 @@ def test_coverage_combines_word_and_tag_denominator() -> None:
     ) == pytest.approx(1.5 / 2.5, abs=1e-12)
 
 
-def test_mechanism_coverage_uses_word_and_mechanism_query_family(
-) -> None:
+def test_mechanism_coverage_uses_word_and_mechanism_query_family() -> None:
     query = (
         cue("handoff", "word", 1.0),
         cue("lease", "mechanism", 1.25),
@@ -186,19 +184,24 @@ def test_mechanism_coverage_uses_word_and_mechanism_query_family(
     assert value == pytest.approx(5.0 / 9.0, abs=1e-12)
 
 
-def test_focused_and_associative_relevance_use_locked_formulas() -> None:
+def test_field_relevance_blends_channels_and_uses_focused_mechanisms() -> None:
     query = (
         cue("direct", "word", 1.0),
         cue("ops", "tag", 1.5),
         cue("lease", "mechanism", 1.25),
+        cue("dir", "char_trigram", 0.35),
     )
     candidate = (
         cue("direct", "mechanism", 1.0),
         cue("lease", "mechanism", 1.25),
     )
 
-    focused = relevance_components(query, candidate, RetrievalMode.FOCUSED)
-    associative = relevance_components(
+    focused = ranking_module.field_relevance_components(
+        query,
+        candidate,
+        RetrievalMode.FOCUSED,
+    )
+    associative = ranking_module.field_relevance_components(
         query,
         candidate,
         RetrievalMode.ASSOCIATIVE,
@@ -207,12 +210,12 @@ def test_focused_and_associative_relevance_use_locked_formulas() -> None:
     assert focused.word_tag_coverage == pytest.approx(0.4, abs=1e-12)
     assert focused.trigram_coverage == 0.0
     assert focused.lexical_or_trigram_relevance == pytest.approx(
-        0.4,
+        0.24,
         abs=1e-12,
     )
     assert focused.mechanism_relevance == pytest.approx(1.0, abs=1e-12)
-    assert focused.ranking_relevance == pytest.approx(0.4, abs=1e-12)
-    assert associative.ranking_relevance == pytest.approx(0.88, abs=1e-12)
+    assert focused.ranking_relevance == pytest.approx(0.544, abs=1e-12)
+    assert associative.ranking_relevance == pytest.approx(0.848, abs=1e-12)
 
 
 @pytest.mark.parametrize(
@@ -291,9 +294,7 @@ def _pool_candidates(
         for index in range(per_temperature):
             values.append(
                 CandidateMatch(
-                    experience_id=UUID(
-                        f"00000000-0000-0000-0000-{serial:012d}"
-                    ),
+                    experience_id=UUID(f"00000000-0000-0000-0000-{serial:012d}"),
                     temperature=temperature,
                     raw_overlap=float(per_temperature - index),
                 )
@@ -345,9 +346,7 @@ def test_temperature_pools_apply_independent_quotas_and_preserve_global_order(
 def test_empty_temperature_pool_does_not_lend_quota() -> None:
     warm_only = tuple(
         CandidateMatch(
-            experience_id=UUID(
-                f"10000000-0000-0000-0000-{index:012d}"
-            ),
+            experience_id=UUID(f"10000000-0000-0000-0000-{index:012d}"),
             temperature=Temperature.WARM,
             raw_overlap=float(100 - index),
         )
@@ -391,9 +390,7 @@ def test_nonpositive_overlap_and_archived_candidates_are_excluded() -> None:
 def test_pool_quota_cutoff_prefers_uuid_bytes_for_equal_overlap() -> None:
     candidates = tuple(
         CandidateMatch(
-            experience_id=UUID(
-                f"21000000-0000-0000-0000-{serial:012d}"
-            ),
+            experience_id=UUID(f"21000000-0000-0000-0000-{serial:012d}"),
             temperature=Temperature.WARM,
             raw_overlap=1.0,
         )
@@ -448,9 +445,7 @@ def _ranking_candidate(
     source_trust: float = 0.8,
 ) -> RankingCandidate:
     return RankingCandidate(
-        experience_id=UUID(
-            f"30000000-0000-0000-0000-{serial:012d}"
-        ),
+        experience_id=UUID(f"30000000-0000-0000-0000-{serial:012d}"),
         temperature=Temperature.WARM,
         current_version_created_at=current_version_created_at,
         terms=terms,
@@ -459,12 +454,9 @@ def _ranking_candidate(
     )
 
 
-def test_rank_candidate_has_no_cached_activation_and_uses_query_clock(
-) -> None:
+def test_rank_candidate_has_no_cached_activation_and_uses_query_clock() -> None:
     candidate = _ranking_candidate()
-    query_at = NOW + timedelta(
-        hours=2 * CONFIG.recency_half_life_hours
-    )
+    query_at = NOW + timedelta(hours=2 * CONFIG.recency_half_life_hours)
     query = (cue("memory", "word"),)
 
     ranked = rank_candidate(
@@ -504,8 +496,7 @@ def test_rank_candidate_rejects_an_empty_overall_query() -> None:
         )
 
 
-def test_rank_candidates_rejects_an_empty_query_with_nonempty_candidates(
-) -> None:
+def test_rank_candidates_rejects_an_empty_query_with_nonempty_candidates() -> None:
     with pytest.raises(ValueError, match="query_cues must not be empty"):
         rank_candidates(
             (_ranking_candidate(),),
@@ -591,9 +582,7 @@ def _ranked_candidate(
     created_at: datetime = NOW,
 ) -> RankedCandidate:
     return RankedCandidate(
-        experience_id=UUID(
-            f"40000000-0000-0000-0000-{serial:012d}"
-        ),
+        experience_id=UUID(f"40000000-0000-0000-0000-{serial:012d}"),
         temperature=Temperature.WARM,
         current_version_created_at=created_at,
         score=score,
@@ -607,6 +596,22 @@ def _ranked_candidate(
         importance=0.5,
         source_trust=0.5,
     )
+
+
+def test_relevance_window_keeps_inclusive_top_relative_boundary() -> None:
+    top = _ranked_candidate(serial=1, ranking_relevance=0.8)
+    boundary = _ranked_candidate(serial=2, ranking_relevance=0.68)
+    below = _ranked_candidate(
+        serial=3,
+        ranking_relevance=math.nextafter(0.68, 0.0),
+    )
+
+    retained = ranking_module.retain_relevance_window(
+        (top, boundary, below),
+        requested_limit=3,
+    )
+
+    assert retained == (top, boundary)
 
 
 def test_final_sort_prefers_score_before_other_fields() -> None:
@@ -674,9 +679,7 @@ def test_final_sort_uses_experience_uuid_bytes_as_last_tie_break() -> None:
         ),
         (
             lambda: CandidateMatch(
-                experience_id=UUID(
-                    "50000000-0000-0000-0000-000000000001"
-                ),
+                experience_id=UUID("50000000-0000-0000-0000-000000000001"),
                 temperature=cast(Any, "warm"),
                 raw_overlap=1.0,
             ),
@@ -684,9 +687,7 @@ def test_final_sort_uses_experience_uuid_bytes_as_last_tie_break() -> None:
         ),
         (
             lambda: RankingCandidate(
-                experience_id=UUID(
-                    "50000000-0000-0000-0000-000000000002"
-                ),
+                experience_id=UUID("50000000-0000-0000-0000-000000000002"),
                 temperature=Temperature.WARM,
                 current_version_created_at=NOW.replace(tzinfo=None),
                 terms=(),

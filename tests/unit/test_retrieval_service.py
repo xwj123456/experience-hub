@@ -37,7 +37,7 @@ from experience_hub.retrieval.service import (
     RetrievalService,
     retrieval_query_hash,
 )
-from experience_hub.retrieval.tokenizer import query_cues
+from experience_hub.retrieval.tokenizer import TermCue, query_cues
 from experience_hub.storage.unit_of_work import UnitOfWork
 
 NOW = datetime(2026, 7, 18, 8, 30, tzinfo=UTC)
@@ -99,11 +99,17 @@ def record(
     )
 
 
-def candidate(value: RetrievalRecord, query: str = "alpha") -> RetrievalCandidate:
+def candidate(
+    value: RetrievalRecord,
+    query: str = "alpha",
+    *,
+    ranking_query: str | None = None,
+) -> RetrievalCandidate:
     terms = query_cues(query)
     return RetrievalCandidate(
         record=value,
         terms=terms,
+        ranking_terms=query_cues(ranking_query or query),
         raw_overlap=1.0,
     )
 
@@ -244,6 +250,82 @@ def test_retrieval_query_hash_has_locked_cue_only_formula() -> None:
         expand_cold=True,
     )
     assert retrieval_query_hash(changed_transport) == retrieval_query_hash(value)
+
+
+@pytest.mark.asyncio
+async def test_search_ranks_bounded_candidates_with_field_aware_terms() -> None:
+    recall_only = record(1)
+    field_match = record(2)
+    query = FakeQuery(
+        candidates=(
+            candidate(recall_only, ranking_query="unrelated"),
+            candidate(field_match, ranking_query="alpha"),
+        ),
+        payloads={},
+        records={},
+        selections=[],
+    )
+    retrieval, writer = service(query)
+
+    result = await retrieval.search(
+        uow=fake_uow(),
+        query=SearchExperiences(
+            owner_agent_id=OWNER_ID,
+            query="alpha",
+            mode=RetrievalMode.FOCUSED,
+            content_budget_bytes=0,
+        ),
+        command=context(),
+    )
+
+    assert [hit.experience.experience_id for hit in result.hits] == [
+        field_match.experience_id
+    ]
+    assert writer.calls == []
+
+
+@pytest.mark.asyncio
+async def test_search_does_not_fill_limit_with_weak_relative_matches() -> None:
+    strongest = record(1)
+    weak = record(2)
+    recall_terms = query_cues("alpha")
+    query = FakeQuery(
+        candidates=(
+            RetrievalCandidate(
+                record=strongest,
+                terms=recall_terms,
+                ranking_terms=(TermCue("alpha", "word", 1.0),),
+                raw_overlap=1.0,
+            ),
+            RetrievalCandidate(
+                record=weak,
+                terms=recall_terms,
+                ranking_terms=(TermCue("alpha", "word", 0.8),),
+                raw_overlap=1.0,
+            ),
+        ),
+        payloads={},
+        records={},
+        selections=[],
+    )
+    retrieval, writer = service(query)
+
+    result = await retrieval.search(
+        uow=fake_uow(),
+        query=SearchExperiences(
+            owner_agent_id=OWNER_ID,
+            query="alpha",
+            mode=RetrievalMode.FOCUSED,
+            limit=2,
+            content_budget_bytes=0,
+        ),
+        command=context(),
+    )
+
+    assert [hit.experience.experience_id for hit in result.hits] == [
+        strongest.experience_id
+    ]
+    assert writer.calls == []
 
 
 @pytest.mark.asyncio
@@ -415,6 +497,42 @@ async def test_focused_cold_expansion_freezes_exact_three_event_intent() -> None
     assert reactivated.signal == 1.0
     assert reactivated.before == reactivated.after
     assert "alpha" not in reactivated.model_dump_json()
+
+
+@pytest.mark.asyncio
+async def test_cold_expansion_uses_full_recall_signal_after_downweight(
+) -> None:
+    cold = record(1, temperature=Temperature.COLD)
+    query = FakeQuery(
+        candidates=(
+            RetrievalCandidate(
+                record=cold,
+                terms=query_cues("alpha"),
+                ranking_terms=(TermCue("alpha", "word", 0.35),),
+                raw_overlap=1.0,
+            ),
+        ),
+        payloads={
+            cold.current_version_id: canonical_json_bytes({"body": "visible"}),
+        },
+        records={cold.experience_id: cold},
+        selections=[],
+    )
+    retrieval, writer = service(query)
+
+    result = await retrieval.search(
+        uow=fake_uow(),
+        query=SearchExperiences(
+            owner_agent_id=OWNER_ID,
+            query="alpha",
+            mode=RetrievalMode.FOCUSED,
+        ),
+        command=context(),
+    )
+
+    assert result.hits[0].experience.body == "visible"
+    assert result.hits[0].reactivated is True
+    assert len(writer.calls) == 1
 
 
 @pytest.mark.asyncio

@@ -132,7 +132,7 @@ reactivation, or temperature events.
 
 ## Deterministic multilingual retrieval
 
-Index and query text share one closed tokenizer:
+Stable recall projection and query text share one closed tokenizer:
 
 1. normalize with Unicode NFKC;
 2. apply Unicode case folding and NFKC again;
@@ -141,13 +141,26 @@ Index and query text share one closed tokenizer:
 5. extract contiguous Unicode Latin-script words; and
 6. generate padded Unicode character trigrams for every normalized script.
 
-This makes English word matching and Chinese or mixed-language trigram
-matching part of one deterministic index. Tags, mechanisms, words, and
-trigrams retain distinct kinds and locked weights. Duplicate cues keep the
-maximum weight, and final cues are sorted canonically. Candidate selection,
-temperature pools, ranking, and UUID tie-breaking are deterministic; no
-language detector, locale state, network service, or wall-clock behavior is
-consulted.
+This makes English word matching and Chinese or mixed-language trigram matching
+part of one deterministic projection. Tags, mechanisms, words, and trigrams
+retain distinct kinds and locked weights. Duplicate cues keep the maximum
+weight, and final cues are sorted canonically.
+
+Active-memory ranking derives a second, non-authoritative term view from bounded
+metadata. It uses the pinned local Chinese dictionary to add multi-character
+words; weights summary and mechanism more strongly than applicability; and
+retains projected body words and trigrams only as weak fallbacks. It does not
+load or decode the body. When both lexical families are present, ranking blends
+word/tag coverage at `0.60` and trigram coverage at `0.40`; explicit focused
+mechanism cues contribute `0.40`. Results below `85%` of the strongest ranking
+relevance are not used merely to fill the requested limit.
+
+Cold memories continue to use the stable recall projection and its original
+inclusive reactivation thresholds. This keeps the public recall signal and
+reactivation event evidence stable while active-memory ranking becomes more
+selective. Candidate selection, temperature pools, ranking, and UUID
+tie-breaking remain deterministic; no language detector, locale state, network
+service, or wall-clock behavior is consulted.
 
 ## Lifecycle, rehearsal, and forgetting
 

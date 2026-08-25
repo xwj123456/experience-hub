@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import subprocess
+import sys
 from collections.abc import Iterable
 from typing import Any, cast
 
 import pytest
 
+import experience_hub.retrieval.tokenizer as tokenizer_module
 from experience_hub.domain import TypedEvidence
 from experience_hub.experiences import VersionContent
 from experience_hub.retrieval.tokenizer import (
@@ -18,6 +21,7 @@ from experience_hub.retrieval.tokenizer import (
     normalize_text,
     padded_char_trigrams,
     query_cues,
+    ranking_query_cues,
 )
 
 
@@ -169,9 +173,7 @@ def test_index_version_terms_deduplicates_by_kind_with_max_not_sum() -> None:
     assert len(cues) == len({(cue.term, cue.term_kind) for cue in cues})
     assert _cue_map(cues)[("cache", "word")] == WORD_WEIGHT
     assert _cue_map(cues)[("cac", "char_trigram")] == TRIGRAM_WEIGHT
-    assert cues == tuple(
-        sorted(cues, key=lambda cue: (cue.term, cue.term_kind))
-    )
+    assert cues == tuple(sorted(cues, key=lambda cue: (cue.term, cue.term_kind)))
 
 
 def test_index_version_terms_keeps_unspaced_chinese_mechanism_as_one_term() -> None:
@@ -202,9 +204,7 @@ def test_index_version_terms_ignores_evidence_and_falsifiers() -> None:
     )
     cues = index_version_terms(content)
     terms = _cue_map(cues)
-    trigram_terms = {
-        cue.term for cue in cues if cue.term_kind == "char_trigram"
-    }
+    trigram_terms = {cue.term for cue in cues if cue.term_kind == "char_trigram"}
 
     assert ("zephyrqx", "word") not in terms
     assert ("vortxid", "word") not in terms
@@ -212,6 +212,52 @@ def test_index_version_terms_ignores_evidence_and_falsifiers() -> None:
     assert "zep" not in trigram_terms
     assert "vor" not in trigram_terms
     assert "plu" not in trigram_terms
+
+
+def test_ranking_terms_weight_bounded_metadata_fields_without_body() -> None:
+    content = VersionContent(
+        body="BodyOnlyToken",
+        summary="Validate cache",
+        mechanism="stale cache",
+        tags=("cache",),
+        applicability=("policy scope",),
+        evidence=(),
+        falsifiers=(),
+    )
+
+    terms = _cue_map(tokenizer_module.ranking_version_terms(content))
+
+    assert terms[("validate", "word")] == 1.0
+    assert terms[("policy", "word")] == 0.45
+    assert terms[("cache", "mechanism")] == MECHANISM_WEIGHT
+    assert terms[("cache", "tag")] == TAG_WEIGHT
+    assert terms[("pol", "char_trigram")] == 0.16
+    assert ("bodyonlytoken", "word") not in terms
+
+
+def test_ranking_terms_keep_projected_body_cues_as_weak_fallbacks() -> None:
+    content = VersionContent(
+        body="not loaded by ranking",
+        summary="summary",
+        mechanism="mechanism",
+        tags=(),
+        applicability=(),
+        evidence=(),
+        falsifiers=(),
+    )
+
+    terms = _cue_map(
+        tokenizer_module.ranking_version_terms(
+            content,
+            recall_terms=(
+                TermCue("bodyonlytoken", "word", 1.0),
+                TermCue("bod", "char_trigram", TRIGRAM_WEIGHT),
+            ),
+        )
+    )
+
+    assert terms[("bodyonlytoken", "word")] == 0.35
+    assert terms[("bod", "char_trigram")] == 0.12
 
 
 def test_query_cues_index_optional_exact_tags_and_mechanism_tokens() -> None:
@@ -232,6 +278,33 @@ def test_query_cues_index_optional_exact_tags_and_mechanism_tokens() -> None:
     assert len(cues) == len({(cue.term, cue.term_kind) for cue in cues})
 
 
+def test_ranking_query_cues_retain_multi_character_chinese_words() -> None:
+    terms = _cue_map(ranking_query_cues("缓存异常后核验生成结果"))
+
+    assert terms[("缓存", "word")] == WORD_WEIGHT
+    assert terms[("异常", "word")] == WORD_WEIGHT
+    assert terms[("核验", "word")] == WORD_WEIGHT
+    assert terms[("生成", "word")] == WORD_WEIGHT
+    assert terms[("结果", "word")] == WORD_WEIGHT
+
+
+def test_first_chinese_query_does_not_write_to_stderr() -> None:
+    result = subprocess.run(
+        (
+            sys.executable,
+            "-c",
+            "from experience_hub.retrieval.tokenizer import ranking_query_cues; "
+            "ranking_query_cues('缓存异常后核验结果')",
+        ),
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0
+    assert result.stderr == ""
+
+
 def test_query_tag_and_mechanism_trigrams_do_not_cross_field_boundaries() -> None:
     cues = query_cues(
         "",
@@ -239,9 +312,7 @@ def test_query_tag_and_mechanism_trigrams_do_not_cross_field_boundaries() -> Non
         mechanisms=("CD",),
     )
     terms = _cue_map(cues)
-    trigram_terms = {
-        cue.term for cue in cues if cue.term_kind == "char_trigram"
-    }
+    trigram_terms = {cue.term for cue in cues if cue.term_kind == "char_trigram"}
 
     assert terms[("ab", "tag")] == TAG_WEIGHT
     assert terms[("cd", "mechanism")] == MECHANISM_WEIGHT
