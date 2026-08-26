@@ -10,7 +10,9 @@
 
 Experience Hub gives AI agents a memory layer that can cool, blur, reactivate, propagate, and inspire without silently rewriting history. It runs locally on SQLite, exposes FastAPI and CLI interfaces, and keeps every durable state transition traceable and replayable.
 
-> Status: `v0.1.0` local MVP. The core contracts are implemented and extensively tested. Production authentication and open-world intelligence evaluation remain intentionally out of scope.
+> Status: `v0.1.0` local MVP. The core contracts and a frozen 30-case
+> ExperienceBench-S pilot are implemented. Production authentication and
+> open-world effectiveness evaluation remain intentionally out of scope.
 
 ## Why Experience Hub?
 
@@ -30,6 +32,7 @@ Most agent-memory systems optimize for storing and retrieving text. Experience H
 - **Safe knowledge sharing** — topics, subscriptions, provenance chains, hop limits, quarantine inboxes, explicit adoption/rejection, retraction, feedback, and observer-relative trust.
 - **Evidence-grounded inspiration** — frozen evidence snapshots, causal-gap, counterfactual, and distant-analogy operators, schema validation, deduplication, incubation, evaluation, and explicit adoption as a hypothesis.
 - **Reliable local operation** — SQLite authority, Alembic migrations, idempotency, interrupted-run recovery, maintenance validation, FastAPI, and Typer CLI.
+- **Isolated policy evaluation** — frozen SQLite snapshots, independent policy-arm clones, canonical evidence, byte-identical replay, and fail-closed safety gates.
 
 ## Architecture
 
@@ -76,13 +79,32 @@ The current committed benchmark verifies:
 | Distractor false reactivations | `0` | `0` |
 | Pending quarantine leakage | `0` | `0` |
 | Adopted provenance completeness | `1.00` | `1.00` |
-| Valid evidence-grounded ideas | `>= 12` | `28` |
+| Valid evidence-grounded ideas | `>= 12` | `21` |
 | Idea schema and evidence validity | `1.00` | `1.00` |
-| Unique mechanism ratio | `>= 0.70` | `0.8214` |
+| Unique mechanism ratio | `>= 0.70` | `1.00` |
 | Same-snapshot false incubation promotion | `0` | `0` |
 | Byte-identical full replay | `true` | `true` |
 
 These results are deterministic regression evidence on committed fixtures. They are not claims of consciousness, universal creativity, or correctness on arbitrary real-world data.
+
+### ExperienceBench-S pilot
+
+The ExperienceBench-S 30-case pilot met its predefined expansion gate and is
+eligible to expand to a 100-or-more-case evaluation. It compares `no_memory`,
+`recent_notes`, `sqlite_bm25`, and `experience_hub` against the same frozen
+source, queries, clocks, budgets, and scoring rubric.
+
+The canonical result is byte-identical across two complete passes. Its mean
+paired utility gain over the strongest baseline is `+72,499` micros, all five
+strata meet the predefined floor, and the recorded owner, quarantine,
+cross-arm-contamination, and source-mutation counts are zero. See the
+[summary](docs/evidence/experiencebench-s-pilot/benchmark-summary.json),
+[full canonical evidence](docs/evidence/experiencebench-s-pilot/benchmark-evidence.json),
+and [reproduction guide](examples/experience-bench-s/README.md).
+
+This result is evidence about deterministic retrieval support on one frozen
+pilot. It does not establish end-to-end coding success, human-equivalent memory,
+universal improvement, or production safety.
 
 ## Run the API
 
@@ -145,6 +167,7 @@ The full suite contains more than 2,000 tests and uses injected clocks, determin
 - [Sharing, quarantine, and provenance](docs/architecture/social-propagation-contracts.md)
 - [Inspiration and incubation](docs/architecture/inspiration-contracts.md)
 - [Local operations and recovery](docs/operations/local-runbook.md)
+- [ExperienceBench-S pilot](examples/experience-bench-s/README.md)
 - [Roadmap](ROADMAP.md)
 
 ## Scope and non-goals

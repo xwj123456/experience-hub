@@ -5,9 +5,10 @@ Experience Replay Lab 是一个本地、离线、CLI-first 的实验边界。它
 policy arm 下运行两次，然后发布 canonical evidence。它不会迁移或写回 source，
 也不会把 replay 结果自动采纳为经验。
 
-当前提交的 `smoke-replay` 只有两个合成 case 和两个 arm。它验证 isolation、
-report validation 和 repeatability；它不是 ExperienceBench-S、human study，
-也不是一般有效性或安全性的证据。
+提交的 `smoke-replay` 只有两个合成 case 和两个 arm。它验证 isolation、report
+validation 和 repeatability。另有一个冻结的 ExperienceBench-S 30-case pilot，
+用于决定是否扩大评测；两者都不是 human study，也不是一般有效性或生产安全性的
+证据。
 
 ## Manifest and dataset closure
 
@@ -79,7 +80,7 @@ entry：`snapshot`、`validation`、`arms` 和 `artifacts`。
 
 ## Required arms and incomplete comparisons
 
-当前两 arm 都是 required：
+smoke replay 的两个 arm 都是 required：
 
 - `no_memory` 返回空 observation，且不打开 clone；
 - `experience_hub` 在自己的 disposable clone 上执行 owner-scoped read-only
@@ -113,6 +114,28 @@ transaction。发布顺序是 profile first、evidence last：profile write 失�
 先前 evidence；evidence write 失败可能留下新的 profile 与先前 evidence 并存。
 消费者应分别验证 evidence 和 profile，不应把“两个文件同时存在”当作事务证明。
 
+## ExperienceBench-S pilot
+
+冻结 pilot 使用独立的 benchmark pack contract，在同一 source、case、clock、seed、
+result limit 和 content budget 下比较四个 required arms：
+
+- `no_memory`：不提供历史证据；
+- `recent_notes`：只使用确定性的近期记录窗口；
+- `sqlite_bm25`：使用本地 SQLite FTS5/BM25；
+- `experience_hub`：使用 owner-scoped 生命周期检索。
+
+30 个 case 覆盖 recurring workflow、environment gotcha、state change、failure
+recovery 和 irrelevant distractor 五个 strata，以及中文、英文和混合语言。两个完整
+pass 必须产生 byte-identical canonical evidence。任一 required arm 缺失、owner 或
+quarantine 泄漏、跨 arm clone 污染、source 变化、replay 不一致或固定效果门槛失败，
+都会让命令以非零状态退出，同时保留可验证的负面证据。
+
+该 pilot 已达到预定义 expansion gate，可以扩大到 100 个或更多 case。公开的
+[canonical evidence](../evidence/experiencebench-s-pilot/benchmark-evidence.json)
+和 [summary](../evidence/experiencebench-s-pilot/benchmark-summary.json) 只证明这一
+冻结评测的确定性检索结果；不证明端到端编码成功、人类等价记忆、普遍改进或生产
+安全。
+
 ## CLI
 
 ```bash
@@ -133,3 +156,21 @@ uv run experience-hub replay verify \
 创建 clones 和 artifacts。`verify` 只验证给定 evidence artifact。所有成功和失败
 都输出一行 canonical JSON；稳定错误不会包含 source path、workspace path、SQL、
 provider output 或 credentials。
+
+ExperienceBench-S 使用独立的 benchmark 子命令：
+
+```bash
+uv run experience-hub replay benchmark inspect \
+  --pack examples/experience-bench-s/pilot-manifest.json
+
+uv run experience-hub replay benchmark run \
+  --pack examples/experience-bench-s/pilot-manifest.json \
+  --workspace .data/experiencebench-s-pilot
+
+uv run experience-hub replay benchmark verify \
+  --report docs/evidence/experiencebench-s-pilot/benchmark-evidence.json
+```
+
+报告验证要求 evidence 与 summary 位于同一安全目录，只允许已声明的报告成员，
+并对目录链和文件执行 no-follow、identity、size 与 canonical-content 校验。公开
+证据不包含 profile、SQLite clone 或本机执行路径。

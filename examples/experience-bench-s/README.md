@@ -36,6 +36,28 @@ The run compares `no_memory`, `recent_notes`, `sqlite_bm25`, and
 each language group (Chinese, English, and mixed), and ten reviewed workflow
 abstractions alongside twenty public-authored scenarios.
 
+## Published result
+
+The ExperienceBench-S 30-case pilot met its predefined expansion gate and is
+eligible to expand to a 100-or-more-case evaluation.
+
+The two deterministic passes produced byte-identical canonical evidence. The
+mean paired utility gain over the strongest baseline was `+72,499` micros; all
+five strata met the predefined `-20,000`-micros floor. Every completeness,
+determinism, safety, overall-effectiveness, and stratum-effectiveness gate passed.
+The recorded owner leak, quarantine leak, cross-arm contamination, and source
+mutation counts were all zero.
+
+- [Canonical summary](../../docs/evidence/experiencebench-s-pilot/benchmark-summary.json)
+- [Canonical evidence](../../docs/evidence/experiencebench-s-pilot/benchmark-evidence.json)
+
+The published pair can be checked without running policy arms:
+
+```bash
+uv run experience-hub replay benchmark verify \
+  --report docs/evidence/experiencebench-s-pilot/benchmark-evidence.json
+```
+
 ## Scoring and gate
 
 Each case has a 1,000,000-micro utility rubric: 450,000 for required evidence,
@@ -57,7 +79,8 @@ network provider, mutate an online database, or treat a missing FTS5 capability 
 a favorable partial result. Logical labels are converted to deterministic local
 identities only inside the generated fixture database.
 
-This 30-case pilot is an expansion decision aid, not a general effectiveness
-claim, a security proof, or a model of human memory or consciousness. It has no
-confidence interval and does not represent production workloads. The frozen input
-must not be adjusted after a measured run to improve its outcome.
+This 30-case pilot is an expansion decision aid, not evidence of end-to-end
+coding success, human-equivalent memory, universal improvement, production
+safety, or consciousness. It has no confidence interval and does not represent
+production workloads. The frozen input must not be adjusted after a measured run
+to improve its outcome.

@@ -1,6 +1,6 @@
 # RFC: Experience Replay Lab
 
-- Status: capture and isolated replay foundation implemented; research cycle planned
+- Status: foundation and 30-case expansion-gate pilot implemented; larger evaluation planned
 - Date: 2026-07-22
 - Audience: agent-framework and coding-agent developers
 - Scope: local-first capture, quarantine, adoption, and isolated replay
@@ -161,9 +161,10 @@ Every experiment pins:
 - seed and optional credential-free model identity;
 - metric and profiler schema versions.
 
-Each arm receives its own database clone. The implemented smoke arms are
-`no_memory` and `experience_hub`; recent notes and SQLite FTS5/BM25 remain
-planned August baselines. Failed required arms cannot contribute to an effect
+Each arm receives its own database clone. The smoke runner uses `no_memory` and
+`experience_hub`. The ExperienceBench-S pilot additionally implements
+`recent_notes` and SQLite FTS5/BM25, so all four baselines execute against the
+same frozen inputs. Failed required arms cannot contribute to an effect
 comparison. Infrastructure failures are recorded without changing other clones.
 
 Canonical evidence reports exclude wall duration, machine paths, credentials,
@@ -196,9 +197,10 @@ batch. Delivery is split into two sequential subprojects:
    profiler artifacts, and ExperienceBench-S.
 
 Both foundation subprojects are implemented: Generic JSONL capture with candidate
-quarantine, and the CLI-only two-arm isolated replay runner with canonical
-evidence. ExperienceBench-S, additional baselines, adversarial expansion and the
-research report remain separate planned work for the August experiment cycle.
+quarantine, and CLI-only isolated replay with canonical evidence. The frozen
+30-case ExperienceBench-S expansion-gate pilot and its four arms are also
+implemented. A 100-or-more-case evaluation, adversarial expansion, independent
+review, and a broader research report remain planned work.
 
 ## Trust and failure semantics
 
@@ -232,10 +234,11 @@ effectiveness.
 
 ### ExperienceBench-S
 
-Research experiments begin in August 2026. The first suite contains at least 100
-paired coding-agent tasks covering recurring workflows, environment-specific
-gotchas, state changes, failure recovery, irrelevant distractors, and Chinese,
-English, and mixed-language evidence.
+The implemented first stage is a frozen 30-case paired retrieval pilot covering
+recurring workflows, environment-specific gotchas, state changes, failure
+recovery, irrelevant distractors, and Chinese, English, and mixed-language
+evidence. It compares `no_memory`, `recent_notes`, `sqlite_bm25`, and
+`experience_hub`.
 
 For the same case, snapshot, clock, and seed, the primary technical outcome is:
 
@@ -243,10 +246,17 @@ For the same case, snapshot, clock, and seed, the primary technical outcome is:
 delta_utility = score_experience_hub - score_strongest_baseline
 ```
 
-The pilot direction continues only when the point estimate improves by at least
-five percentage points. A general effectiveness claim additionally requires a
-paired 95% confidence interval whose lower bound is above zero and no principal
-task stratum more than two percentage points worse than the strongest baseline.
+The ExperienceBench-S 30-case pilot met its predefined expansion gate and is
+eligible to expand to a 100-or-more-case evaluation. Its
+[canonical evidence](../evidence/experiencebench-s-pilot/benchmark-evidence.json)
+and [summary](../evidence/experiencebench-s-pilot/benchmark-summary.json) are
+limited to deterministic retrieval support on that frozen pack. They do not
+establish end-to-end coding success, human-equivalent memory, universal
+improvement, or production safety.
+
+A broader effectiveness claim would require the expanded evaluation, a paired
+95% confidence interval whose lower bound is above zero, and no principal task
+stratum more than two percentage points worse than the strongest baseline.
 
 ### Experience Firewall adversarial suite
 
@@ -295,16 +305,15 @@ are stronger adoption signals.
 - CLI inspect/run/verify flow, public contracts and clean-room package checks.
 - Sensitive-content, private-path and raw-UUID checks for replay output.
 
-Public release remains blocked until the maintainer deliberately selects a
-license. This RFC does not select or change the project license.
-
 ### August 2026: first experiment cycle
 
-- Week 1: add recent-notes and SQLite FTS5/BM25 baselines to the implemented
-  isolated runner.
-- Week 2: run the planned 100-case ExperienceBench-S pilot.
-- Week 3: run and expand the planned Experience Firewall adversarial suite.
-- Week 4: publish a research report from the pilot plus its profiler artifact.
+- Completed: recent-notes and SQLite FTS5/BM25 baselines in the isolated runner.
+- Completed: frozen 30-case ExperienceBench-S expansion-gate pilot and public
+  canonical evidence.
+- Next: expand ExperienceBench-S to 100 or more cases with independent review.
+- Next: run and expand the Experience Firewall adversarial suite.
+- Next: publish a broader research report; keep machine-local profiler artifacts
+  separate from canonical score evidence.
 
 No external participant count blocks this cycle.
 

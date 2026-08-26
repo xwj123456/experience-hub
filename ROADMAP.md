@@ -4,10 +4,14 @@ Experience Hub is intentionally conservative: provenance, isolation, and explici
 
 ## 0.2 — evaluation and interoperability
 
-- Publish domain-oriented benchmark packs and blinded human-evaluation guidance.
+- Expand the completed 30-case ExperienceBench-S expansion-gate pilot to a
+  100-or-more-case evaluation with independent review.
+- Publish additional domain-oriented benchmark packs and blinded
+  human-evaluation guidance.
 - Define stable import/export envelopes for portable experiences and evidence snapshots.
 - Add observability hooks and performance baselines for larger local datasets.
-- Expand retrieval evaluation beyond committed synthetic fixtures.
+- Add externally reproduced result bundles and broaden evaluation beyond the
+  committed frozen fixture.
 
 ## 0.3 — production integration boundary
 
