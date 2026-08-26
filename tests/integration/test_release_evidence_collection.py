@@ -415,7 +415,7 @@ def test_subprocess_runner_allows_the_full_pytest_suite_more_bounded_time(
         argv=("uv", "lock", "--check"),
     )
 
-    assert observed_timeouts == [1800.0, 900.0]
+    assert observed_timeouts == [3600.0, 900.0]
 
 
 def test_subprocess_runner_maps_timeout_to_a_stable_failure(

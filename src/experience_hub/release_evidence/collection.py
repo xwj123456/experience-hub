@@ -42,7 +42,7 @@ _PYTEST_PROGRESS = re.compile(
     rb"(?:[.]+[ \t]+\[[ \t]*(?:100|[1-9][0-9]?)%\]\n)*"
 )
 _DEFAULT_TIMEOUT_SECONDS = 900.0
-_PYTEST_TIMEOUT_SECONDS = 1800.0
+_PYTEST_TIMEOUT_SECONDS = 3600.0
 
 
 @dataclass(frozen=True, slots=True)
