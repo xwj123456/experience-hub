@@ -42,6 +42,7 @@ _PYTEST_PROGRESS = re.compile(
     rb"(?:[.]+[ \t]+\[[ \t]*(?:100|[1-9][0-9]?)%\]\n)*"
 )
 _DEFAULT_TIMEOUT_SECONDS = 900.0
+_PYTEST_TIMEOUT_SECONDS = 1800.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,6 +74,7 @@ class SubprocessCheckRunner:
 
     repository: Path
     timeout_seconds: float = _DEFAULT_TIMEOUT_SECONDS
+    pytest_timeout_seconds: float = _PYTEST_TIMEOUT_SECONDS
 
     def run(
         self,
@@ -90,7 +92,11 @@ class SubprocessCheckRunner:
                 capture_output=True,
                 shell=False,
                 stdin=subprocess.DEVNULL,
-                timeout=self.timeout_seconds,
+                timeout=(
+                    self.pytest_timeout_seconds
+                    if name is CheckName.PYTEST
+                    else self.timeout_seconds
+                ),
             )
         except (OSError, subprocess.TimeoutExpired):
             pass

@@ -386,6 +386,38 @@ def test_subprocess_runner_keeps_the_required_suite_timeout_bounded() -> None:
     assert runner.timeout_seconds == 900.0
 
 
+def test_subprocess_runner_allows_the_full_pytest_suite_more_bounded_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = SubprocessCheckRunner(Path("/repository"))
+    observed_timeouts: list[object] = []
+
+    def completed(
+        *args: object,
+        **kwargs: object,
+    ) -> subprocess.CompletedProcess[bytes]:
+        observed_timeouts.append(kwargs["timeout"])
+        return subprocess.CompletedProcess(
+            args=args[0],
+            returncode=0,
+            stdout=b"",
+            stderr=b"",
+        )
+
+    monkeypatch.setattr(subprocess, "run", completed)
+
+    runner.run(
+        name=CheckName.PYTEST,
+        argv=("uv", "run", "pytest", "--no-cov", "-q"),
+    )
+    runner.run(
+        name=CheckName.LOCK,
+        argv=("uv", "lock", "--check"),
+    )
+
+    assert observed_timeouts == [1800.0, 900.0]
+
+
 def test_subprocess_runner_maps_timeout_to_a_stable_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
