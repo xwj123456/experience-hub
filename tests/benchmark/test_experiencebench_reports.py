@@ -37,6 +37,7 @@ from experience_hub.experiments.benchmarks.metrics import (
 )
 from experience_hub.experiments.benchmarks.oracles import score_benchmark_observation
 from experience_hub.experiments.benchmarks.reports import (
+    _validate_arm,
     canonical_benchmark_evidence_bytes,
     canonical_benchmark_pass_bytes,
     canonical_benchmark_profile_bytes,
@@ -226,6 +227,25 @@ def test_benchmark_report_recomputes_metric_gate_and_summary_state() -> None:
         verify_benchmark_summary_bytes(
             canonical_json_bytes(summary_document), evidence_body=evidence
         )
+
+
+@pytest.mark.parametrize(
+    ("error_code", "error_stage"),
+    (
+        ("benchmark_policy_failed", None),
+        (None, "policy"),
+    ),
+)
+def test_report_validation_rejects_complete_arms_with_partial_error_details(
+    error_code: str | None, error_stage: str | None
+) -> None:
+    case = _payload().cases[0]
+    arm = case.arms[0].model_copy(
+        update={"error_code": error_code, "error_stage": error_stage}
+    )
+
+    with pytest.raises(ExperimentOutputError, match="Benchmark arm is invalid"):
+        _validate_arm(case, arm)
 
 
 def test_benchmark_evidence_rejects_coherently_rederived_oracle_tampering() -> None:

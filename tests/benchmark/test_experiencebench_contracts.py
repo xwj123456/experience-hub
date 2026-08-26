@@ -15,6 +15,7 @@ from tests.benchmark.experiencebench_factories import (
 from experience_hub.canonical import canonical_json_bytes
 from experience_hub.experiments.benchmarks.contracts import (
     BENCHMARK_ARM_ORDER,
+    BenchmarkArmEvidenceV1,
     BenchmarkArmKind,
     BenchmarkCaseV1,
     BenchmarkCategoryScoresV1,
@@ -227,6 +228,26 @@ def _complete_arm_document(arm_id: str) -> dict[str, object]:
         "error_code": None,
         "error_stage": None,
     }
+
+
+@pytest.mark.parametrize(
+    ("error_code", "error_stage"),
+    (
+        ("benchmark_policy_failed", None),
+        (None, "policy"),
+    ),
+)
+def test_complete_arm_rejects_partial_error_details(
+    error_code: str | None, error_stage: str | None
+) -> None:
+    document = _complete_arm_document("no_memory")
+    document["error_code"] = error_code
+    document["error_stage"] = error_stage
+
+    with pytest.raises(
+        ValidationError, match="complete arms require observation and oracle only"
+    ):
+        BenchmarkArmEvidenceV1.model_validate_json(canonical_json_bytes(document))
 
 
 def _valid_safety_document() -> dict[str, object]:

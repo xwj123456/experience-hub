@@ -288,7 +288,12 @@ def _validate_arm(
     case: BenchmarkCaseEvidenceV1, arm: BenchmarkArmEvidenceV1
 ) -> bool:
     if arm.status == "complete":
-        if arm.observation is None or arm.oracle is None:
+        if (
+            arm.observation is None
+            or arm.oracle is None
+            or arm.error_code is not None
+            or arm.error_stage is not None
+        ):
             raise _reject("invalid_benchmark_evidence", "Benchmark arm is invalid")
         try:
             expected_oracle = score_benchmark_observation(case.case, arm.observation)
@@ -301,7 +306,12 @@ def _validate_arm(
                 "invalid_benchmark_evidence", "Benchmark oracle evidence is invalid"
             )
         return True
-    if arm.observation is not None or arm.oracle is not None:
+    if (
+        arm.observation is not None
+        or arm.oracle is not None
+        or arm.error_code is None
+        or arm.error_stage is None
+    ):
         raise _reject("invalid_benchmark_evidence", "Benchmark arm is invalid")
     return False
 
