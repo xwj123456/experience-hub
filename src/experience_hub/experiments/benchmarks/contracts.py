@@ -497,14 +497,15 @@ class BenchmarkArmEvidenceV1(_BenchmarkModel):
     @model_validator(mode="after")
     def validate_status_payload(self) -> Self:
         complete = self.status == "complete"
-        has_result = self.observation is not None and self.oracle is not None
+        has_any_result = self.observation is not None or self.oracle is not None
+        has_complete_result = self.observation is not None and self.oracle is not None
         has_any_error = self.error_code is not None or self.error_stage is not None
         has_complete_error = (
             self.error_code is not None and self.error_stage is not None
         )
-        if complete and (not has_result or has_any_error):
+        if complete and (not has_complete_result or has_any_error):
             raise ValueError("complete arms require observation and oracle only")
-        if not complete and (has_result or not has_complete_error):
+        if not complete and (has_any_result or not has_complete_error):
             raise ValueError("failed arms require stable error details only")
         return self
 

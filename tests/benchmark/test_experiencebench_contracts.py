@@ -250,6 +250,27 @@ def test_complete_arm_rejects_partial_error_details(
         BenchmarkArmEvidenceV1.model_validate_json(canonical_json_bytes(document))
 
 
+@pytest.mark.parametrize("result_field", ("observation", "oracle"))
+def test_failed_arm_rejects_partial_result_details(result_field: str) -> None:
+    document = _complete_arm_document("no_memory")
+    retained_result = document[result_field]
+    document.update(
+        {
+            "status": "failed",
+            "observation": None,
+            "oracle": None,
+            "error_code": "benchmark_policy_failed",
+            "error_stage": "policy",
+        }
+    )
+    document[result_field] = retained_result
+
+    with pytest.raises(
+        ValidationError, match="failed arms require stable error details only"
+    ):
+        BenchmarkArmEvidenceV1.model_validate_json(canonical_json_bytes(document))
+
+
 def _valid_safety_document() -> dict[str, object]:
     return {
         "schema_version": 1,
