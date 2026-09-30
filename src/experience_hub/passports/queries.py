@@ -15,7 +15,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from experience_hub.canonical import canonical_json_bytes
 from experience_hub.clock import require_utc
-from experience_hub.domain import StructuredReason
+from experience_hub.domain import EventRegistry, StructuredReason
+from experience_hub.experiences.contracts import ExperienceRecord
+from experience_hub.experiences.events import register_experience_events
+from experience_hub.experiences.models import Temperature
 from experience_hub.passports.codec import VerifiedPassportV1, verify_passport_bytes
 from experience_hub.passports.contracts import (
     PassportAdoptionV1,
@@ -29,10 +32,28 @@ from experience_hub.passports.events import (
     PassportImportedV1,
     PassportRejectedV1,
 )
+from experience_hub.passports.receipts import (
+    prior_experience_snapshot,
+    require_receipt_anchor,
+    require_receipt_result,
+)
 from experience_hub.passports.repository import PassportRecord, PassportRepository
-from experience_hub.passports.requests import passport_import_request
-from experience_hub.passports.responses import passport_import_response
-from experience_hub.storage.tables import DomainEventRow, IdempotencyRecordRow
+from experience_hub.passports.requests import (
+    passport_adopt_request,
+    passport_import_request,
+    passport_reject_request,
+)
+from experience_hub.passports.responses import (
+    passport_adoption_response,
+    passport_import_response,
+)
+from experience_hub.storage.idempotency import StoredResponse
+from experience_hub.storage.tables import (
+    DomainEventRow,
+    ExperienceRow,
+    IdempotencyRecordRow,
+    PassportAdoptionRow,
+)
 
 
 class PassportQuery:
@@ -180,39 +201,26 @@ class PassportQuery:
                 or state.projection_event_id != events[-1].event_id
             ):
                 raise ValueError
-            receipt = await session.scalar(
-                select(IdempotencyRecordRow).where(
-                    IdempotencyRecordRow.receipt_id == anchor.causation_id,
-                    IdempotencyRecordRow.caller_scope
-                    == f"agent:{source.owner_agent_id}",
-                )
+            receipt = await self._receipt(
+                session=session, event=anchor, owner=source.owner_agent_id
             )
-            if (
-                receipt is None
-                or receipt.scope != "passport.import"
-                or receipt.state != "completed"
-                or receipt.response_status_code != 201
-                or receipt.result_resource_type != "passport_import"
-                or receipt.result_resource_id != source.import_id
-                or receipt.created_at != source.imported_at
-                or receipt.completed_at is None
-                or receipt.completed_at < receipt.created_at
-                or receipt.request_hash
-                != passport_import_request(
+            require_receipt_result(
+                receipt=receipt,
+                request=passport_import_request(
                     owner_agent_id=source.owner_agent_id,
                     passport_hash=source.passport_hash,
                     idempotency_key=receipt.idempotency_key,
-                ).request_hash
-                or receipt.response_body
-                != passport_import_response(
+                ),
+                resource_type="passport_import",
+                resource_id=source.import_id,
+                response=passport_import_response(
                     import_id=source.import_id,
                     owner_agent_id=source.owner_agent_id,
                     passport_hash=source.passport_hash,
                     state=PassportState.PENDING,
                     status_code=201,
-                ).body
-            ):
-                raise ValueError
+                ),
+            )
             reason = None
             if state.state is PassportState.PENDING:
                 if adoption is not None or state.decided_at is not None:
@@ -226,6 +234,9 @@ class PassportQuery:
                     or decision.actor_agent_id != source.owner_agent_id
                 ):
                     raise ValueError
+                receipt = await self._receipt(
+                    session=session, event=decision, owner=source.owner_agent_id
+                )
                 if state.state is PassportState.REJECTED:
                     payload: PassportRejectedV1 | PassportAdoptedV1
                     payload = PassportRejectedV1.model_validate_json(decision.payload)
@@ -246,6 +257,23 @@ class PassportQuery:
                         or adoption is not None
                     ):
                         raise ValueError
+                    require_receipt_result(
+                        receipt=receipt,
+                        request=passport_reject_request(
+                            owner_agent_id=source.owner_agent_id,
+                            import_id=source.import_id,
+                            reason=reason,
+                            idempotency_key=receipt.idempotency_key,
+                        ),
+                        resource_type="passport_import",
+                        resource_id=source.import_id,
+                        response=passport_import_response(
+                            import_id=source.import_id,
+                            owner_agent_id=source.owner_agent_id,
+                            passport_hash=source.passport_hash,
+                            state=PassportState.REJECTED,
+                        ),
+                    )
                 else:
                     adopted = PassportAdoptedV1.model_validate_json(decision.payload)
                     if (
@@ -269,6 +297,21 @@ class PassportQuery:
                         != prepared.document.subject.content_hash
                     ):
                         raise ValueError
+                    require_receipt_result(
+                        receipt=receipt,
+                        request=passport_adopt_request(
+                            owner_agent_id=source.owner_agent_id,
+                            import_id=source.import_id,
+                            importance=adoption.importance,
+                            confidence=adoption.confidence,
+                            idempotency_key=receipt.idempotency_key,
+                        ),
+                        resource_type="passport_adoption",
+                        resource_id=adoption.adoption_id,
+                        response=await self._adoption_response(
+                            session=session, adoption=adoption, event=decision
+                        ),
+                    )
                     payload = adopted
                 if payload.import_id != source.import_id or (
                     payload.owner_agent_id != source.owner_agent_id
@@ -295,6 +338,76 @@ class PassportQuery:
             )
         except (TypeError, ValueError, ValidationError):
             raise PassportError("invalid") from None
+
+    async def _receipt(
+        self, *, session: AsyncSession, event: DomainEventRow, owner: UUID
+    ) -> IdempotencyRecordRow:
+        receipt = await session.scalar(
+            select(IdempotencyRecordRow).where(
+                IdempotencyRecordRow.receipt_id == event.causation_id,
+                IdempotencyRecordRow.caller_scope == f"agent:{owner}",
+            )
+        )
+        return require_receipt_anchor(receipt=receipt, event=event, owner=owner)
+
+    async def _adoption_response(
+        self,
+        *,
+        session: AsyncSession,
+        adoption: PassportAdoptionRow,
+        event: DomainEventRow,
+    ) -> StoredResponse:
+        temperature = Temperature.WARM
+        if not adoption.created:
+            # Only the owned target's earlier events can establish its historical
+            # response. Current temperature may have changed since adoption.
+            rows = tuple(
+                (
+                    await session.scalars(
+                        select(DomainEventRow)
+                        .join(
+                            ExperienceRow,
+                            ExperienceRow.experience_id == DomainEventRow.aggregate_id,
+                        )
+                        .where(
+                            ExperienceRow.owner_agent_id == adoption.owner_agent_id,
+                            DomainEventRow.aggregate_type == "experience",
+                            DomainEventRow.aggregate_id
+                            == adoption.resulting_experience_id,
+                            DomainEventRow.event_id < event.event_id,
+                        )
+                        .order_by(DomainEventRow.event_id)
+                    )
+                ).all()
+            )
+            registry = EventRegistry()
+            register_experience_events(registry)
+            snapshot = prior_experience_snapshot(
+                registry=registry,
+                rows=rows,
+                experience_id=adoption.resulting_experience_id,
+                before_event_id=event.event_id,
+            )
+            if (
+                snapshot is None
+                or snapshot.owner_agent_id != adoption.owner_agent_id
+                or snapshot.current_version_id != adoption.resulting_version_id
+                or snapshot.current_content_hash != adoption.resulting_content_hash
+                or snapshot.temperature == Temperature.ARCHIVED
+            ):
+                raise ValueError("Invalid Passport adoption history")
+            temperature = snapshot.temperature
+        return passport_adoption_response(
+            adoption_id=adoption.adoption_id,
+            experience=ExperienceRecord(
+                experience_id=adoption.resulting_experience_id,
+                owner_agent_id=adoption.owner_agent_id,
+                current_version_id=adoption.resulting_version_id,
+                current_content_hash=adoption.resulting_content_hash,
+                temperature=temperature,
+            ),
+            created=adoption.created,
+        )
 
 
 def _encode_cursor(

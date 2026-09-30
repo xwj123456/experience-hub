@@ -9,11 +9,10 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from experience_hub import canonical_json_bytes
-from experience_hub.domain import CommandRequest, EventPayload, EventRegistry
+from experience_hub.domain import CommandRequest, EventRegistry
 from experience_hub.experiences.contracts import ExperienceRecord
 from experience_hub.experiences.events import (
     ExperienceCreatedV1,
-    ExperienceStateSnapshotV1,
     ExperienceVersionCreatedV1,
 )
 from experience_hub.experiences.models import ExperienceOrigin, Temperature
@@ -29,6 +28,11 @@ from experience_hub.passports.events import (
     PassportAdoptedV1,
     PassportImportedV1,
     PassportRejectedV1,
+)
+from experience_hub.passports.receipts import (
+    prior_experience_snapshot,
+    require_receipt_anchor,
+    require_receipt_result,
 )
 from experience_hub.passports.requests import (
     passport_adopt_request,
@@ -334,16 +338,10 @@ class PassportSourceValidator:
         owner: UUID,
     ) -> IdempotencyRecordRow:
         receipt = await session.get(IdempotencyRecordRow, event.causation_id)
-        if (
-            receipt is None
-            or receipt.state != "completed"
-            or receipt.caller_scope != f"agent:{owner}"
-            or receipt.created_at != event.occurred_at
-            or receipt.completed_at is None
-            or receipt.completed_at < event.occurred_at
-        ):
-            raise _fail()
-        return receipt
+        try:
+            return require_receipt_anchor(receipt=receipt, event=event, owner=owner)
+        except ValueError:
+            raise _fail() from None
 
     async def _require_result(
         self,
@@ -354,18 +352,16 @@ class PassportSourceValidator:
         resource_id: UUID,
         response: StoredResponse,
     ) -> None:
-        if (
-            receipt.scope != request.operation_scope
-            or receipt.request_hash != request.request_hash
-            or receipt.result_resource_type != resource_type
-            or receipt.result_resource_id != resource_id
-            or receipt.response_status_code != response.status_code
-            or receipt.response_body != response.body
-            or receipt.response_content_type != response.content_type
-            or receipt.response_headers
-            != canonical_json_bytes(dict(response.headers or {}))
-        ):
-            raise _fail()
+        try:
+            require_receipt_result(
+                receipt=receipt,
+                request=request,
+                resource_type=resource_type,
+                resource_id=resource_id,
+                response=response,
+            )
+        except ValueError:
+            raise _fail() from None
 
     async def _adoption(
         self,
@@ -466,8 +462,11 @@ class PassportSourceValidator:
         else:
             if causal != (event,):
                 raise _fail()
-            snapshot = self._prior_snapshot(
-                rows, identity.experience_id, event.event_id
+            snapshot = prior_experience_snapshot(
+                registry=self._registry,
+                rows=rows,
+                experience_id=identity.experience_id,
+                before_event_id=event.event_id,
             )
             if (
                 snapshot is None
@@ -502,26 +501,6 @@ class PassportSourceValidator:
                 created=adoption.created,
             ),
         )
-
-    def _prior_snapshot(
-        self,
-        rows: tuple[DomainEventRow, ...],
-        experience_id: UUID,
-        before_event_id: int,
-    ) -> ExperienceStateSnapshotV1 | None:
-        result: ExperienceStateSnapshotV1 | None = None
-        for row in rows:
-            if row.event_id >= before_event_id:
-                break
-            if row.aggregate_type != "experience" or row.aggregate_id != experience_id:
-                continue
-            payload: EventPayload = self._registry.decode(
-                event_type=row.event_type, payload=row.payload
-            )
-            after = getattr(payload, "after", None)
-            if isinstance(after, ExperienceStateSnapshotV1):
-                result = after
-        return result
 
 
 def register_passport_source_validator(validator: SourceValidator) -> None:
