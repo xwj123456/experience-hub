@@ -33,6 +33,7 @@ from experience_hub.experiences import (
     encode_version_content,
 )
 from experience_hub.ids import IdGenerator
+from experience_hub.passports.errors import PassportError
 from experience_hub.sharing.confidence import initial_adoption_confidence
 from experience_hub.sharing.events import (
     CapsuleAdoptedV1,
@@ -412,6 +413,13 @@ class SharingService:
             )
         except ExperienceNotFoundError:
             raise
+        if selected.origin is ExperienceOrigin.ADOPTED_PASSPORT:
+            unsupported = PassportError("publication_unsupported")
+            raise _command_error(
+                code=unsupported.code,
+                message=unsupported.message,
+                status_code=unsupported.status_code,
+            )
         if selected.temperature is Temperature.ARCHIVED:
             raise _command_error(
                 code="restore_required",

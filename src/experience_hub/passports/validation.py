@@ -41,6 +41,7 @@ from experience_hub.passports.responses import (
 )
 from experience_hub.storage.idempotency import StoredResponse
 from experience_hub.storage.tables import (
+    AgentRow,
     DomainEventRow,
     ExperiencePayloadRow,
     ExperienceRow,
@@ -116,6 +117,13 @@ class PassportSourceValidator:
         created_targets: dict[UUID, int] = defaultdict(int)
         for source in imports:
             try:
+                owner_created_at = await session.scalar(
+                    select(AgentRow.created_at).where(
+                        AgentRow.agent_id == source.owner_agent_id
+                    )
+                )
+                if owner_created_at is None or source.imported_at < owner_created_at:
+                    raise _fail()
                 prepared = verify_passport_bytes(source.canonical_bytes)
                 if prepared.document.passport_hash != source.passport_hash:
                     raise _fail()

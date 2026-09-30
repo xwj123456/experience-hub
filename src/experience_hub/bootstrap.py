@@ -19,6 +19,9 @@ from experience_hub.experiences.candidate_events import register_candidate_event
 from experience_hub.experiences.candidate_projector import CandidateStateProjector
 from experience_hub.experiences.candidate_repository import CandidateRepository
 from experience_hub.experiences.candidate_service import CandidateService
+from experience_hub.experiences.evidence_snapshots import (
+    ExperienceEvidenceSnapshotReader,
+)
 from experience_hub.experiences.projector import (
     ExperienceProjector,
     ExperienceTermsProjector,
@@ -62,7 +65,11 @@ from experience_hub.lifecycle.worker import (
     ProductionLifecycleTicker,
 )
 from experience_hub.passports.events import register_passport_events
+from experience_hub.passports.export import PassportExportService
 from experience_hub.passports.projector import PassportStateProjector
+from experience_hub.passports.queries import PassportQuery
+from experience_hub.passports.repository import PassportRepository
+from experience_hub.passports.service import PassportService
 from experience_hub.passports.validation import register_passport_source_validator
 from experience_hub.retrieval.service import (
     ExperienceEvidenceReader,
@@ -124,6 +131,11 @@ class ApplicationContainer:
     capture_service: CaptureService
     candidate_repository: CandidateRepository
     candidate_service: CandidateService
+    passport_repository: PassportRepository
+    passport_query: PassportQuery
+    passport_service: PassportService
+    passport_export_service: PassportExportService
+    experience_evidence_snapshot_reader: ExperienceEvidenceSnapshotReader
     experience_repository: ExperienceRepository
     experience_query: ExperienceQuery
     experience_writer: ExperienceWriter
@@ -277,6 +289,21 @@ class ApplicationContainer:
             clock=retained_clock,
             id_generator=retained_ids,
         )
+        passport_repository = PassportRepository()
+        passport_query = PassportQuery(repository=passport_repository)
+        experience_evidence_snapshot_reader = ExperienceEvidenceSnapshotReader()
+        passport_export_service = PassportExportService(
+            experience_query=experience_query,
+            evidence_reader=experience_evidence_snapshot_reader,
+            passport_query=passport_query,
+        )
+        passport_service = PassportService(
+            repository=passport_repository,
+            experience_writer=experience_writer,
+            receipt_store=receipt_store,
+            clock=retained_clock,
+            id_generator=retained_ids,
+        )
         experience_mutation_writer = ExperienceMutationWriter(
             repository=experience_repository,
             lifecycle_config=retained_lifecycle_config,
@@ -397,6 +424,11 @@ class ApplicationContainer:
             capture_service=capture_service,
             candidate_repository=candidate_repository,
             candidate_service=candidate_service,
+            passport_repository=passport_repository,
+            passport_query=passport_query,
+            passport_service=passport_service,
+            passport_export_service=passport_export_service,
+            experience_evidence_snapshot_reader=experience_evidence_snapshot_reader,
             experience_repository=experience_repository,
             experience_query=experience_query,
             experience_writer=experience_writer,

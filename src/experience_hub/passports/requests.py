@@ -3,6 +3,7 @@
 from uuid import UUID
 
 from experience_hub.domain import CommandRequest, StructuredReason
+from experience_hub.passports.contracts import AdoptPassport
 from experience_hub.passports.scopes import (
     PASSPORT_ADOPT_SCOPE,
     PASSPORT_IMPORT_SCOPE,
@@ -32,6 +33,12 @@ def passport_adopt_request(
     confidence: float,
     idempotency_key: str,
 ) -> CommandRequest:
+    decision = AdoptPassport(
+        owner_agent_id=owner_agent_id,
+        import_id=import_id,
+        importance=importance,
+        confidence=confidence,
+    )
     return CommandRequest(
         caller_scope=f"agent:{owner_agent_id}",
         operation_scope=PASSPORT_ADOPT_SCOPE,
@@ -39,7 +46,7 @@ def passport_adopt_request(
         method="POST",
         route_template="/v1/agents/{agent_id}/passports/{import_id}/adopt",
         path_parameters={"agent_id": owner_agent_id, "import_id": import_id},
-        body={"importance": importance, "confidence": confidence},
+        body={"importance": decision.importance, "confidence": decision.confidence},
     )
 
 

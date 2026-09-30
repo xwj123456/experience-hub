@@ -627,6 +627,7 @@ class SharingSourceValidator:
                 )
                 if (
                     identity.owner_agent_id != row.publisher_agent_id
+                    or identity.origin is ExperienceOrigin.ADOPTED_PASSPORT
                     or identity.kind != row.kind
                     or identity.created_at > row.created_at
                     or version.experience_id != row.source_experience_id

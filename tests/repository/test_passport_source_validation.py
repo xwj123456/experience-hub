@@ -162,6 +162,20 @@ async def test_valid_pending_source_uses_foreign_ids_only_as_provenance(
         await container.source_validator.validate(session)
 
 
+async def test_import_cannot_predate_its_owner_birth(
+    container: ApplicationContainer,
+) -> None:
+    await _seed_import(container)
+    async with container.database._engine.begin() as connection:
+        await connection.execute(text("DROP TRIGGER agents_reject_update"))
+        await connection.execute(
+            text("UPDATE agents SET created_at='2026-09-30T09:00:00.000000Z'")
+        )
+    async with container.database.read_session() as session:
+        with pytest.raises(SourceIntegrityError, match="Passport source graph"):
+            await PassportSourceValidator(container.event_registry).validate(session)
+
+
 @pytest.mark.parametrize(
     "column",
     [
