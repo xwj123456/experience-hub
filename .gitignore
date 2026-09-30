@@ -33,6 +33,7 @@ provider-secrets.*
 # Local process output and logs.
 .logs/
 logs/
+/outputs/
 *.log
 
 # Build and virtual environments.

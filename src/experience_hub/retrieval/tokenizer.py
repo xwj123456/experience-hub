@@ -5,11 +5,22 @@ from __future__ import annotations
 import logging
 import math
 import unicodedata
+import warnings
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from typing import Final, Literal, Protocol
 
-import jieba  # type: ignore[import-untyped]
+with warnings.catch_warnings():
+    # Python 3.12 reports known escape literals in the pinned jieba sources on
+    # a cold import. Limit suppression to those sources and that warning; other
+    # diagnostics remain visible, and CLI responses do not reveal install paths.
+    warnings.filterwarnings(
+        "ignore",
+        message=r"invalid escape sequence.*",
+        category=SyntaxWarning,
+        module=r".*[\\/]jieba[\\/].*|jieba([.].*)?",
+    )
+    import jieba  # type: ignore[import-untyped]
 
 TermKind = Literal["word", "char_trigram", "tag", "mechanism"]
 _TERM_KINDS = frozenset({"word", "char_trigram", "tag", "mechanism"})

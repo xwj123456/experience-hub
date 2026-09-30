@@ -3,18 +3,28 @@
 from __future__ import annotations
 
 import unicodedata
+import warnings
 from dataclasses import dataclass
 from enum import StrEnum
 from fractions import Fraction
 from functools import lru_cache
 from itertools import combinations
 
-import jieba  # type: ignore[import-untyped]
-import jieba.posseg as jieba_posseg  # type: ignore[import-untyped]
-
 from experience_hub.canonical import canonical_json_bytes
 from experience_hub.inspiration.models import SnapshotItem
 from experience_hub.retrieval.tokenizer import normalize_text
+
+with warnings.catch_warnings():
+    # The pinned POS extension has the same Python 3.12 escape warnings as jieba.
+    # Scope this filter to its cold import, without silencing other diagnostics.
+    warnings.filterwarnings(
+        "ignore",
+        message=r"invalid escape sequence.*",
+        category=SyntaxWarning,
+        module=r".*[\\/]jieba[\\/].*|jieba([.].*)?",
+    )
+    import jieba  # type: ignore[import-untyped]
+    import jieba.posseg as jieba_posseg  # type: ignore[import-untyped]
 
 _ENGLISH_NEGATORS = frozenset({"not", "no", "never", "without", "cannot"})
 _CJK_NEGATORS = frozenset({"非", "不", "无", "未"})

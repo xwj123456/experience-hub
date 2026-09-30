@@ -30,6 +30,9 @@ Most agent-memory systems optimize for storing and retrieving text. Experience H
 - **Lifecycle-aware retrieval** — focused and associative retrieval, Chinese and English tokenization, bounded content expansion, blurred cold results, stable ranking, and explicit access effects.
 - **Auditable history** — immutable experience versions, canonical content hashes, causation receipts, append-only domain events, and rebuildable projections.
 - **Safe knowledge sharing** — topics, subscriptions, provenance chains, hop limits, quarantine inboxes, explicit adoption/rejection, retraction, feedback, and observer-relative trust.
+- **Offline evidence transfer** — unsigned, single-version Evidence Passports
+  with explicit evidence coverage, bounded provenance, owner-scoped quarantine,
+  and local adoption decisions.
 - **Evidence-grounded inspiration** — frozen evidence snapshots, causal-gap, counterfactual, and distant-analogy operators, schema validation, deduplication, incubation, evaluation, and explicit adoption as a hypothesis.
 - **Reliable local operation** — SQLite authority, Alembic migrations, idempotency, interrupted-run recovery, maintenance validation, FastAPI, and Typer CLI.
 - **Isolated policy evaluation** — frozen SQLite snapshots, independent policy-arm clones, canonical evidence, byte-identical replay, and fail-closed safety gates.
@@ -87,6 +90,11 @@ The current committed benchmark verifies:
 
 These results are deterministic regression evidence on committed fixtures. They are not claims of consciousness, universal creativity, or correctness on arbitrary real-world data.
 
+The default runtime database is `.data/experience_hub.db` under the current
+working directory, not the source checkout. Installed packages carry their own
+migrations and do not require a repository checkout. Passport commands that
+use a database require an explicit `--database` path.
+
 ### ExperienceBench-S pilot
 
 The ExperienceBench-S 30-case pilot met its predefined expansion gate and is
@@ -135,6 +143,35 @@ The current API has no production authentication layer. Bind to localhost and do
 
 All state-changing HTTP commands require a unique `Idempotency-Key`. Retrying the same canonical request replays the stored response byte-for-byte; reusing the key for another request returns a conflict.
 
+## Transfer an experience offline
+
+An Evidence Passport carries one immutable experience version and its retained
+evidence snapshots between independent local databases. Inspect the synthetic
+capture example without opening a database:
+
+```bash
+uv run experience-hub passport inspect \
+  examples/passports/capture-recovery.passport.json
+```
+
+Inspection checks canonical encoding, hashes, and evidence bindings. It reports
+publisher identity as `unverified` and semantic assessment as `not_assessed`:
+an unsigned hash does not authenticate a publisher or establish a conclusion.
+Evidence may be an `embedded_excerpt` or `reference_only`; neither includes the
+complete original source.
+
+Import remains quarantined until the receiving owner explicitly adopts it with
+local importance and confidence. The default path calls no model, reads no
+model key, and accesses no network. Passport v1 provides local CLI and Python
+services, not HTTP Passport endpoints.
+
+Follow the [two-database tutorial](docs/tutorials/passport-transfer.md) for
+export, inspection, import, rejection, retry, and adoption. The
+[contract](docs/architecture/passport-contracts.md) covers the 512 KiB file
+limit, four-source-hop limit, read-only export requirements, and sharing
+boundaries. Review content usage rights separately from this project's source
+code license.
+
 ## Inspiration safety boundary
 
 An idea is deliberately separate from memory:
@@ -165,6 +202,8 @@ The full suite contains more than 2,000 tests and uses injected clocks, determin
 - [Foundation ledger and projection contracts](docs/architecture/foundation-contracts.md)
 - [Memory lifecycle and retrieval](docs/architecture/experience-lifecycle-contracts.md)
 - [Sharing, quarantine, and provenance](docs/architecture/social-propagation-contracts.md)
+- [Evidence Passport contracts](docs/architecture/passport-contracts.md)
+- [Offline Passport transfer tutorial](docs/tutorials/passport-transfer.md)
 - [Inspiration and incubation](docs/architecture/inspiration-contracts.md)
 - [Local operations and recovery](docs/operations/local-runbook.md)
 - [ExperienceBench-S pilot](examples/experience-bench-s/README.md)
