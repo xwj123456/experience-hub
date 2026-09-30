@@ -48,6 +48,9 @@ def run_migrations_online() -> None:
     connectable = create_engine(
         configured_url(),
         poolclass=pool.NullPool,
+        # Legacy sqlite3 transaction control commits DDL before the first DML.
+        # Python 3.12's explicit mode keeps schema and revision updates atomic.
+        connect_args={"autocommit": False},
     )
 
     with connectable.connect() as connection:
@@ -55,6 +58,8 @@ def run_migrations_online() -> None:
             connection=connection,
             target_metadata=target_metadata,
             render_as_batch=True,
+            transactional_ddl=True,
+            transaction_per_migration=True,
         )
 
         with context.begin_transaction():
