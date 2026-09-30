@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 from uuid import UUID
@@ -9,6 +10,7 @@ import pytest
 from sqlalchemy import text
 from sqlalchemy.engine import URL
 
+import experience_hub.runtime as runtime_module
 from experience_hub.bootstrap import ApplicationContainer
 from experience_hub.config import Settings
 from experience_hub.experiences.candidate_events import CANDIDATE_EVENT_TYPES
@@ -26,6 +28,34 @@ from experience_hub.storage.validation import (
 
 def _settings(path: Path) -> Settings:
     return Settings(database_url=f"sqlite+aiosqlite:///{path}")
+
+
+@pytest.mark.asyncio
+async def test_default_runtime_creates_only_the_exact_special_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    directory = tmp_path / "cwd?exact"
+    directory.mkdir()
+    monkeypatch.chdir(directory)
+    expected = directory / ".data" / "experience_hub.db"
+
+    async with ApplicationRuntime(Settings()).initialize(
+        start_lifecycle_worker=False, recover_interrupted=False
+    ) as container:
+        assert container.schema_revision is not None
+
+    assert expected.is_file()
+    assert not (tmp_path / "cwd").exists()
+
+
+def test_materialized_migration_path_preserves_percent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    resource = tmp_path / "package%portable" / "migrations"
+    monkeypatch.setattr(runtime_module, "as_file", lambda _: nullcontext(resource))
+
+    with runtime_module._alembic_config() as config:
+        assert config.get_main_option("script_location") == str(resource)
 
 
 @pytest.mark.asyncio
@@ -93,9 +123,7 @@ async def test_runtime_migrates_exact_structured_url_with_question_mark_path(
         ) as container,
         container.database.read_session() as session,
     ):
-        revision = await session.scalar(
-            text("SELECT version_num FROM alembic_version")
-        )
+        revision = await session.scalar(text("SELECT version_num FROM alembic_version"))
         assert revision == "0007_capture_evidence_hashes"
         assert revision == container.schema_revision
 

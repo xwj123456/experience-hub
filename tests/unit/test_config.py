@@ -28,3 +28,20 @@ def test_explicit_database_is_preserved_outside_repository(
 
     assert Settings(database_url=url).database_url == url
     assert not (tmp_path / "explicit.sqlite3").exists()
+
+
+@pytest.mark.parametrize("name", ["cwd?exact", "cwd#exact", "cwd%exact", "中文 空格"])
+def test_default_database_preserves_special_directory_names(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, name: str
+) -> None:
+    directory = tmp_path / name
+    directory.mkdir()
+    monkeypatch.chdir(directory)
+
+    settings = Settings()
+
+    assert settings.database_url is not None
+    assert make_url(settings.database_url).database == str(
+        directory / ".data" / "experience_hub.db"
+    )
+    assert not (directory / ".data").exists()

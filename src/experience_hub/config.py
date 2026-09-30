@@ -30,4 +30,8 @@ class Settings:
     def __post_init__(self) -> None:
         if self.database_url is None:
             path = Path.cwd() / ".data" / "experience_hub.db"
-            object.__setattr__(self, "database_url", f"sqlite+aiosqlite:///{path}")
+            object.__setattr__(
+                self,
+                "database_url",
+                URL.create("sqlite+aiosqlite", database=str(path)),
+            )

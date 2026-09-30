@@ -79,7 +79,9 @@ def _alembic_config(url: URL | None = None) -> Iterator[Config]:
     with as_file(resources) as migration_directory:
         config = Config()
         config.attributes["configure_logger"] = False
-        config.set_main_option("script_location", str(migration_directory))
+        config.set_main_option(
+            "script_location", str(migration_directory).replace("%", "%%")
+        )
         if url is not None:
             config.attributes["sqlalchemy_url"] = url
         yield config

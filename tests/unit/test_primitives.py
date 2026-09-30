@@ -3,19 +3,19 @@ from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
+from sqlalchemy.engine import make_url
 
 from experience_hub.config import Settings
 from experience_hub.domain.values import StructuredReason, TypedEvidence
 
 
-def test_settings_uses_repository_relative_default_and_explicit_override(
-    repository_root: Path,
-) -> None:
+def test_settings_uses_cwd_default_and_explicit_override() -> None:
     default = Settings()
     explicit = Settings(database_url="sqlite+aiosqlite:///tmp/override.db")
 
-    assert default.database_url == (
-        f"sqlite+aiosqlite:///{repository_root / '.data' / 'experience_hub.db'}"
+    assert default.database_url is not None
+    assert make_url(default.database_url).database == str(
+        Path.cwd() / ".data" / "experience_hub.db"
     )
     assert explicit.database_url == "sqlite+aiosqlite:///tmp/override.db"
 
