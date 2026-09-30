@@ -12,6 +12,7 @@ from experience_hub.capture.models import (
     SensitiveMatchV1,
     TrajectoryBundleV1,
 )
+from experience_hub.domain import StrictModel
 
 _SECRET_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
     (
@@ -58,6 +59,24 @@ def _matching_rule_ids(values: Iterable[str]) -> tuple[str, ...]:
         rule_id
         for rule_id, pattern in _SECRET_RULES
         if any(pattern.search(value) is not None for value in retained)
+    )
+
+
+class TextSensitiveMatchV1(StrictModel):
+    """A caller-supplied schema position, never secret text or an input ID."""
+
+    rule_id: str
+    position: str
+
+
+def scan_text_fields(
+    fields: Iterable[tuple[str, str]],
+) -> tuple[TextSensitiveMatchV1, ...]:
+    """Scan retained text using capture's existing rule set."""
+    return tuple(
+        TextSensitiveMatchV1(rule_id=rule_id, position=position)
+        for position, value in fields
+        for rule_id in _matching_rule_ids((value,))
     )
 
 

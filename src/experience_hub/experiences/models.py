@@ -29,6 +29,7 @@ class ExperienceOrigin(StrEnum):
     ADOPTED_CAPSULE = "adopted_capsule"
     ADOPTED_IDEA = "adopted_idea"
     ADOPTED_CANDIDATE = "adopted_candidate"
+    ADOPTED_PASSPORT = "adopted_passport"
 
 
 class Temperature(StrEnum):

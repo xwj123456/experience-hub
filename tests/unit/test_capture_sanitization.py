@@ -22,6 +22,18 @@ from experience_hub.capture import (
 )
 from experience_hub.experiences import ExperienceKind
 
+
+def test_text_field_scanner_returns_only_stable_position_and_rule() -> None:
+    from experience_hub.capture.sanitization import scan_text_fields
+
+    probe = "ghp_" + "a" * 36
+    matches = scan_text_fields((("subject.content.body", probe),))
+    assert [match.model_dump() for match in matches] == [
+        {"rule_id": "github_token", "position": "subject.content.body"}
+    ]
+    assert probe not in repr(matches)
+
+
 OWNER = UUID("10000000-0000-4000-8000-000000000001")
 STARTED_AT = datetime(2026, 7, 22, 1, 0, tzinfo=UTC)
 
