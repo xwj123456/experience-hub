@@ -20,7 +20,7 @@ def repository_root(start: Path | None = None) -> Path:
 
 @dataclass(frozen=True, slots=True)
 class Settings:
-    """Runtime settings with a repository-relative SQLite default."""
+    """Runtime settings with a working-directory-relative SQLite default."""
 
     database_url: str | URL | None = None
     openai_compatible_base_url: str | None = None
@@ -29,5 +29,5 @@ class Settings:
 
     def __post_init__(self) -> None:
         if self.database_url is None:
-            path = repository_root() / ".data" / "experience_hub.db"
+            path = Path.cwd() / ".data" / "experience_hub.db"
             object.__setattr__(self, "database_url", f"sqlite+aiosqlite:///{path}")

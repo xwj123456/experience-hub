@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Awaitable, Callable
-from contextlib import asynccontextmanager
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
+from contextlib import asynccontextmanager, contextmanager
+from importlib.resources import as_file, files
 from pathlib import Path
 from typing import Any
 
@@ -18,7 +19,7 @@ from sqlalchemy.engine import URL, make_url
 
 from experience_hub.bootstrap import ApplicationContainer
 from experience_hub.clock import Clock
-from experience_hub.config import Settings, repository_root
+from experience_hub.config import Settings
 from experience_hub.ids import IdGenerator
 from experience_hub.storage.database import (
     DatabaseBusy,
@@ -67,19 +68,36 @@ def _synchronous_sqlite_url(settings: Settings) -> URL:
     return url.set(drivername="sqlite", database=str(database_path))
 
 
-def _alembic_config(url: URL) -> Config:
-    root = repository_root()
-    config = Config(str(root / "alembic.ini"))
+@contextmanager
+def _alembic_config(url: URL | None = None) -> Iterator[Config]:
+    resources = files("experience_hub.storage").joinpath("migrations")
     # Embedded migrations run inside a host process whose logging handlers are
     # owned by that host (Uvicorn, a test harness, or another application).
     # Alembic's standalone CLI may still configure logging from alembic.ini.
-    config.attributes["configure_logger"] = False
-    config.set_main_option(
-        "script_location",
-        str(root / "src" / "experience_hub" / "storage" / "migrations"),
-    )
-    config.attributes["sqlalchemy_url"] = url
-    return config
+    # Materialized package resources must remain alive throughout migration,
+    # including when the package is loaded from a non-filesystem resource.
+    with as_file(resources) as migration_directory:
+        config = Config()
+        config.attributes["configure_logger"] = False
+        config.set_main_option("script_location", str(migration_directory))
+        if url is not None:
+            config.attributes["sqlalchemy_url"] = url
+        yield config
+
+
+def installed_schema_head() -> str:
+    """Return the installed migration head without opening a database."""
+    try:
+        with _alembic_config() as config:
+            head = ScriptDirectory.from_config(config).get_current_head()
+    except CommandError:
+        raise SchemaRevisionError(
+            current_revision=None,
+            expected_revision="single_head",
+        ) from None
+    if head is None:
+        raise RuntimeError("Alembic migration history has no single head")
+    return head
 
 
 def _current_revision(url: URL) -> str | None:
@@ -99,28 +117,28 @@ def _known_ancestors(script: ScriptDirectory, head: str) -> frozenset[str]:
 
 def _migrate_to_head_sync(settings: Settings) -> str:
     url = _synchronous_sqlite_url(settings)
-    config = _alembic_config(url)
-    script = ScriptDirectory.from_config(config)
-    head = script.get_current_head()
-    if head is None:
-        raise RuntimeError("Alembic migration history has no single head")
+    with _alembic_config(url) as config:
+        script = ScriptDirectory.from_config(config)
+        head = script.get_current_head()
+        if head is None:
+            raise RuntimeError("Alembic migration history has no single head")
 
-    current = _current_revision(url)
-    if current is not None:
-        try:
-            script.get_revision(current)
-        except CommandError as error:
-            raise SchemaRevisionError(
-                current_revision=current,
-                expected_revision=head,
-            ) from error
-        if current not in _known_ancestors(script, head):
-            raise SchemaRevisionError(
-                current_revision=current,
-                expected_revision=head,
-            )
+        current = _current_revision(url)
+        if current is not None:
+            try:
+                script.get_revision(current)
+            except CommandError as error:
+                raise SchemaRevisionError(
+                    current_revision=current,
+                    expected_revision=head,
+                ) from error
+            if current not in _known_ancestors(script, head):
+                raise SchemaRevisionError(
+                    current_revision=current,
+                    expected_revision=head,
+                )
 
-    command.upgrade(config, "head")
+        command.upgrade(config, "head")
     migrated = _current_revision(url)
     if migrated != head:
         raise RuntimeError("Database migration did not reach the expected head")
@@ -139,17 +157,14 @@ async def migrate_to_head(settings: Settings) -> str:
 
 def _require_current_schema_sync(settings: Settings) -> str:
     url = _synchronous_sqlite_url(settings)
+    head = installed_schema_head()
     try:
-        script = ScriptDirectory.from_config(_alembic_config(url))
-        head = script.get_current_head()
         current = _current_revision(url)
     except CommandError:
         raise SchemaRevisionError(
             current_revision=None,
-            expected_revision="single_head",
+            expected_revision=head,
         ) from None
-    if head is None:
-        raise RuntimeError("Alembic migration history has no single head")
     if current != head:
         raise SchemaRevisionError(
             current_revision=current,
@@ -234,6 +249,7 @@ __all__ = [
     "ApplicationRuntime",
     "SchemaRevisionError",
     "SchemaVersionError",
+    "installed_schema_head",
     "migrate_to_head",
     "require_current_schema",
 ]
