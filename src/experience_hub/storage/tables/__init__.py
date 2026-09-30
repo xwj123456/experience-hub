@@ -33,6 +33,11 @@ from experience_hub.storage.tables.inspiration import (
     InspirationSnapshotItemRow,
     MechanismIncubationRow,
 )
+from experience_hub.storage.tables.passports import (
+    PassportAdoptionRow,
+    PassportImportRow,
+    PassportStateRow,
+)
 from experience_hub.storage.tables.sharing import (
     AdoptionRecordRow,
     AgentReputationRow,
@@ -73,6 +78,9 @@ __all__ = [
     "InspirationSnapshotItemRow",
     "LifecycleLeaseRow",
     "MechanismIncubationRow",
+    "PassportAdoptionRow",
+    "PassportImportRow",
+    "PassportStateRow",
     "ProjectionVersionRow",
     "SubscriptionRow",
     "TopicRow",

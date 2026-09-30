@@ -80,7 +80,7 @@ async def test_freeze_and_validate_clone_exact_closed_database_bytes(
     assert snapshot.database_bytes == source_bytes
     assert len(snapshot.database_sha256) == 64
     assert clone.read_bytes() == source_bytes
-    assert revision == "0007_capture_evidence_hashes"
+    assert revision == "0008_evidence_passports"
     assert seeded_database.read_bytes() == source_bytes
 
 
@@ -830,7 +830,7 @@ async def test_validation_opens_exact_clone_when_path_contains_question_mark(
         seed=37,
     )
 
-    assert revision == "0007_capture_evidence_hashes"
+    assert revision == "0008_evidence_passports"
     assert validation_path.read_bytes() == snapshot.database_bytes
     assert not (tmp_path / "validation").exists()
 

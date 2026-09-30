@@ -61,6 +61,9 @@ from experience_hub.lifecycle.worker import (
     LifecycleWorker,
     ProductionLifecycleTicker,
 )
+from experience_hub.passports.events import register_passport_events
+from experience_hub.passports.projector import PassportStateProjector
+from experience_hub.passports.validation import register_passport_source_validator
 from experience_hub.retrieval.service import (
     ExperienceEvidenceReader,
     RetrievalService,
@@ -201,6 +204,7 @@ class ApplicationContainer:
 
         register_experience_events(event_registry)
         register_candidate_events(event_registry)
+        register_passport_events(event_registry)
         register_sharing_events(event_registry)
         register_inspiration_events(event_registry)
 
@@ -208,6 +212,7 @@ class ApplicationContainer:
         register_agent_source_validator(source_validator)
         register_experience_source_validator(source_validator)
         register_capture_source_validator(source_validator)
+        register_passport_source_validator(source_validator)
         register_sharing_source_validator(source_validator)
         register_inspiration_source_validator(source_validator)
 
@@ -216,6 +221,7 @@ class ApplicationContainer:
                 ExperienceProjector(event_registry, retained_lifecycle_config),
                 ExperienceTermsProjector(event_registry),
                 CandidateStateProjector(event_registry),
+                PassportStateProjector(event_registry),
                 CapsuleStateProjector(event_registry),
                 AgentReputationProjector(event_registry),
                 InboxItemProjector(event_registry),

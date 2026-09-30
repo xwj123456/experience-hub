@@ -772,7 +772,7 @@ def test_falsifiers_upgrade_preserves_existing_0004_snapshot_rows(
             ) == canonical_json_bytes([])
             assert (
                 connection.scalar(text("SELECT version_num FROM alembic_version"))
-                == "0007_capture_evidence_hashes"
+                == "0008_evidence_passports"
             )
     finally:
         upgraded.dispose()
@@ -847,7 +847,7 @@ def test_falsifiers_upgrade_accepts_the_pre_fix_0004_column(
             ) == legacy_falsifiers
             assert (
                 connection.scalar(text("SELECT version_num FROM alembic_version"))
-                == "0007_capture_evidence_hashes"
+                == "0008_evidence_passports"
             )
             assert (
                 connection.scalar(

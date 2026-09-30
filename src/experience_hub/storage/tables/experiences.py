@@ -60,7 +60,7 @@ class ExperienceRow(Base):
         ),
         CheckConstraint(
             "origin IN ('local','adopted_capsule','adopted_idea',"
-            "'adopted_candidate')",
+            "'adopted_candidate','adopted_passport')",
             name="ck_experiences_origin",
         ),
         Index(

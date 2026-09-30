@@ -84,7 +84,7 @@ async def test_runtime_migrates_and_initializes_a_fresh_database(
         recover_interrupted=False,
     ) as container:
         retained = container
-        assert container.schema_revision == "0007_capture_evidence_hashes"
+        assert container.schema_revision == "0008_evidence_passports"
         assert container.lifecycle_worker.running is False
         async with container.database.read_session() as session:
             version = await session.scalar(
@@ -124,7 +124,7 @@ async def test_runtime_migrates_exact_structured_url_with_question_mark_path(
         container.database.read_session() as session,
     ):
         revision = await session.scalar(text("SELECT version_num FROM alembic_version"))
-        assert revision == "0007_capture_evidence_hashes"
+        assert revision == "0008_evidence_passports"
         assert revision == container.schema_revision
 
     assert database_path.is_file()
@@ -197,7 +197,7 @@ async def test_shutdown_stops_worker_then_runs_hooks_before_engine_disposal(
 
         container.register_shutdown_hook(observe_shutdown)
 
-    assert observations == [(False, "0007_capture_evidence_hashes")]
+    assert observations == [(False, "0008_evidence_passports")]
 
 
 @pytest.mark.asyncio

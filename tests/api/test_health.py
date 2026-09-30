@@ -16,6 +16,7 @@ EXPECTED_REDUCER_VERSIONS = {
     "inbox_items": 1,
     "inspiration_run_state": 1,
     "mechanism_incubation": 1,
+    "passport_state": 1,
 }
 
 
@@ -36,7 +37,7 @@ def test_health_becomes_ready_after_real_runtime_initialization(
     assert response.json() == {
         "data": {
             "reducer_versions": EXPECTED_REDUCER_VERSIONS,
-            "schema_revision": "0007_capture_evidence_hashes",
+            "schema_revision": "0008_evidence_passports",
             "status": "ready",
             "version": "0.1.0",
         }
