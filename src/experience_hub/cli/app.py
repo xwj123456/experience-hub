@@ -20,6 +20,7 @@ from experience_hub.benchmark.runner import run_benchmark
 from experience_hub.canonical import canonical_json_bytes
 from experience_hub.cli.capture_commands import candidate_app, capture_app
 from experience_hub.cli.demo import build_demo_report
+from experience_hub.cli.passport_commands import passport_app
 from experience_hub.cli.release_commands import release_app
 from experience_hub.cli.replay_commands import replay_app
 from experience_hub.clock import require_utc
@@ -76,6 +77,7 @@ app.add_typer(projections_app, name="projections")
 app.add_typer(payloads_app, name="payloads")
 app.add_typer(capture_app, name="capture")
 app.add_typer(candidate_app, name="candidates")
+app.add_typer(passport_app, name="passport")
 app.add_typer(replay_app, name="replay")
 app.add_typer(release_app, name="release")
 
