@@ -10,6 +10,7 @@ import subprocess
 import sys
 import time
 from contextlib import closing
+from hashlib import sha256
 from pathlib import Path
 from typing import Any, cast
 
@@ -132,6 +133,44 @@ def _prepare_benchmark_fixtures(root: Path) -> None:
     destination.mkdir(parents=True)
     for name in ("seed.json", "cases.jsonl"):
         shutil.copy2(PROJECT_ROOT / "benchmarks" / name, destination / name)
+
+
+@pytest.fixture
+def preserved_default_workspace(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> tuple[Path, dict[Path, str]]:
+    retained_root = tmp_path / "retained-root"
+    _prepare_benchmark_fixtures(retained_root)
+    data_root = retained_root / ".data"
+    for name in (
+        "experience_hub.db",
+        "demo.db",
+        "benchmark/snapshot/pre-run.sqlite3",
+        "benchmark/replay-a/retained.sqlite3",
+        "benchmark/replay-b/retained.sqlite3",
+    ):
+        database = data_root / name
+        database.parent.mkdir(parents=True, exist_ok=True)
+        with closing(sqlite3.connect(database)) as connection:
+            connection.execute("CREATE TABLE retained_data (value TEXT)")
+            connection.execute("INSERT INTO retained_data VALUES ('keep me')")
+            connection.commit()
+    for name in ("demo.db", "experience_hub.db"):
+        for suffix in ("-wal", "-shm", "-journal"):
+            (data_root / f"{name}{suffix}").write_bytes(b"retained sidecar")
+    (data_root / "benchmark" / ".experience-hub-benchmark-workspace").write_bytes(
+        b"experience-hub deterministic benchmark workspace\n"
+    )
+    before = {
+        path.relative_to(data_root): sha256(path.read_bytes()).hexdigest()
+        for path in data_root.rglob("*")
+        if path.is_file()
+    }
+    monkeypatch.setattr(config, "repository_root", lambda: retained_root)
+    monkeypatch.chdir(retained_root)
+
+    return data_root, before
 
 
 def test_release_candidate_acceptance(
@@ -345,7 +384,15 @@ def test_release_candidate_acceptance(
     assert reconcile_data["errors"] == []
 
 
-def test_checked_in_release_evidence_matches_stable_runtime_summaries() -> None:
+def test_checked_in_release_evidence_matches_stable_runtime_summaries(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    preserved_default_workspace: tuple[Path, dict[Path, str]],
+) -> None:
+    sandbox_root = tmp_path / "release-evidence-root"
+    _prepare_benchmark_fixtures(sandbox_root)
+    monkeypatch.setattr(config, "repository_root", lambda: sandbox_root)
+
     evidence_path = PROJECT_ROOT / "docs" / "evidence" / "release-evidence.json"
     body = evidence_path.read_bytes()
     evidence = ReleaseEvidenceReportV1.model_validate_json(body, strict=True)
@@ -354,6 +401,7 @@ def test_checked_in_release_evidence_matches_stable_runtime_summaries() -> None:
 
     demo = _canonical_cli_document(RUNNER.invoke(app, ["demo", "--reset"]))
     demo_data = cast(dict[str, Any], demo["data"])
+    assert demo_data["database_path"] == str(sandbox_root / ".data" / "demo.db")
     assert evidence.data.demo.all_invariants_hold is True
     assert evidence.data.demo.stage_count == len(
         cast(list[dict[str, Any]], demo_data["stages"])
@@ -361,6 +409,10 @@ def test_checked_in_release_evidence_matches_stable_runtime_summaries() -> None:
 
     benchmark = _canonical_cli_document(RUNNER.invoke(app, ["benchmark"]))
     benchmark_data = cast(dict[str, Any], benchmark["data"])
+    benchmark_root = sandbox_root / ".data" / "benchmark"
+    assert (benchmark_root / "snapshot" / "pre-run.sqlite3").is_file()
+    assert (benchmark_root / "replay-a").is_dir()
+    assert (benchmark_root / "replay-b").is_dir()
     gates = cast(list[dict[str, Any]], benchmark_data["gates"])
     assert evidence.data.benchmark.passed is benchmark_data["passed"]
     assert evidence.data.benchmark.case_count == len(
@@ -378,6 +430,14 @@ def test_checked_in_release_evidence_matches_stable_runtime_summaries() -> None:
             "pending_capsule_leakage_count"
         ]
     )
+    data_root, before = preserved_default_workspace
+    after = {
+        path.relative_to(data_root): sha256(path.read_bytes()).hexdigest()
+        for path in data_root.rglob("*")
+        if path.is_file()
+    }
+    assert after == before, "release verification changed retained local data"
+
 
 def _unused_loopback_port() -> int:
     with closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as listener:
