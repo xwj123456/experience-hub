@@ -7,6 +7,8 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from textwrap import dedent
@@ -244,12 +246,20 @@ def _run(
     )
 
 
-@pytest.fixture(scope="module")
-def installed_passport(tmp_path_factory: pytest.TempPathFactory) -> InstalledPassport:
-    root = tmp_path_factory.mktemp("installed-passport")
+def _install_passport(
+    root: Path,
+    *,
+    relocatable: bool = False,
+    environment_name: str = "venv?井#percent%🧪",
+) -> InstalledPassport:
+    root.mkdir()
     wheels, requirements = root / "wheels", root / "requirements.txt"
-    environment = root / "venv?井#percent%🧪"
+    environment = root / environment_name
     python = environment / "bin/python"
+    venv_arguments = ["uv", "venv", "--offline", "--python", sys.executable]
+    if relocatable:
+        venv_arguments.append("--relocatable")
+    venv_arguments.append(str(environment))
     for arguments in (
         ["uv", "build", "--offline", "--wheel", "--out-dir", str(wheels)],
         [
@@ -264,7 +274,7 @@ def installed_passport(tmp_path_factory: pytest.TempPathFactory) -> InstalledPas
             "--output-file",
             str(requirements),
         ],
-        ["uv", "venv", "--offline", "--python", sys.executable, str(environment)],
+        venv_arguments,
         ["uv", "pip", "sync", "--offline", "--python", str(python), str(requirements)],
     ):
         result = _run(arguments, cwd=PROJECT_ROOT)
@@ -317,6 +327,37 @@ def installed_passport(tmp_path_factory: pytest.TempPathFactory) -> InstalledPas
     return InstalledPassport(
         python, environment / "bin/experience-hub", root / "audit.log"
     )
+
+
+@pytest.fixture(scope="module")
+def installation_root() -> Iterator[Path]:
+    # A short external root prevents length-triggered shell wrappers from hiding
+    # Darwin's hash-containing direct-shebang failure. Only test-owned files live here.
+    with tempfile.TemporaryDirectory(prefix="eh-p-", dir="/tmp") as directory:
+        root = Path(directory).resolve()
+        assert not root.is_relative_to(PROJECT_ROOT)
+        yield root
+
+
+def _assert_short_hash_interpreter(python: Path) -> None:
+    executable = os.fsencode(python)
+    assert b"#" in executable
+    assert not any(character in executable for character in (b" ", b"\t", b"\n"))
+    assert len(b"#!" + executable + b"\n") <= 127
+
+
+@pytest.fixture(scope="module")
+def installed_passport(installation_root: Path) -> InstalledPassport:
+    installed = _install_passport(installation_root / "native", relocatable=True)
+    _assert_short_hash_interpreter(installed.python)
+    return installed
+
+
+@pytest.fixture(scope="module")
+def installed_module(installation_root: Path) -> InstalledPassport:
+    installed = _install_passport(installation_root / "module")
+    _assert_short_hash_interpreter(installed.python)
+    return installed
 
 
 def _json_result(result: subprocess.CompletedProcess[str], *, success: bool) -> dict:
@@ -659,4 +700,125 @@ def test_installed_inspect_rejects_bad_files_without_database_or_input_echo(
     )
     assert result["error"]["code"] == "passport_file_invalid"
     assert bad.read_text().find(probe) >= 0
+    assert not installed.audit_log.exists(), installed.audit_log.read_text()
+
+
+def test_installed_module_help_works_in_short_hash_environment(
+    installed_module: InstalledPassport, tmp_path: Path
+) -> None:
+    installed, cwd = installed_module, _cwd(tmp_path)
+    before = set(cwd.iterdir())
+    result = _run(
+        [str(installed.python), "-I", "-m", "experience_hub", "--help"],
+        cwd=cwd,
+        installed=installed,
+        no_sqlite=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stderr == ""
+    assert "passport" in result.stdout and "serve" in result.stdout
+    assert set(cwd.iterdir()) == before
+    assert not installed.audit_log.exists(), installed.audit_log.read_text()
+
+
+@pytest.mark.parametrize("kind", ("valid", "malformed", "sensitive"))
+def test_installed_module_inspect_matches_native_without_database_or_input_echo(
+    installed_passport: InstalledPassport,
+    installed_module: InstalledPassport,
+    tmp_path: Path,
+    kind: str,
+) -> None:
+    cwd = _cwd(tmp_path)
+    passport = cwd / "input?井#percent%🧪.passport.json"
+    original = (
+        PROJECT_ROOT / "examples/passports/capture-recovery.passport.json"
+    ).read_bytes()
+    probe = "ghp_" + "Z" * 36
+    if kind == "valid":
+        passport.write_bytes(original)
+    elif kind == "malformed":
+        passport.write_text('{"synthetic_private_probe":"' + probe + '"}')
+    else:
+        wire = json.loads(original)
+        wire["declaration"]["profile_id"] = probe
+        wire.pop("passport_hash")
+        canonical = json.dumps(
+            wire, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode()
+        wire["passport_hash"] = hashlib.sha256(canonical).hexdigest()
+        passport.write_text(
+            json.dumps(wire, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        )
+    input_before = passport.read_bytes()
+    paths_before = set(cwd.iterdir())
+    arguments = ["passport", "inspect", str(passport)]
+    native = _run(
+        [str(installed_passport.console), *arguments],
+        cwd=cwd,
+        installed=installed_passport,
+        no_sqlite=True,
+    )
+    module = _run(
+        [str(installed_module.python), "-I", "-m", "experience_hub", *arguments],
+        cwd=cwd,
+        installed=installed_module,
+        no_sqlite=True,
+    )
+    document = _json_result(module, success=kind == "valid")
+    assert (module.returncode, module.stdout, module.stderr) == (
+        native.returncode,
+        native.stdout,
+        native.stderr,
+    )
+    if kind == "valid":
+        assert document["data"]["publisher_identity"] == "unverified"
+        assert document["data"]["semantic_assessment"] == "not_assessed"
+    else:
+        assert document["error"]["code"] == {
+            "malformed": "passport_invalid",
+            "sensitive": "passport_sensitive_content",
+        }[kind]
+    assert probe not in module.stdout and str(cwd) not in module.stdout
+    assert passport.read_bytes() == input_before
+    assert set(cwd.iterdir()) == paths_before
+    for installed in (installed_passport, installed_module):
+        assert not installed.audit_log.exists(), installed.audit_log.read_text()
+
+
+@pytest.mark.parametrize("path_kind", ("ascii", "long-special"))
+def test_installed_console_plain_and_long_path_controls(
+    installation_root: Path, tmp_path: Path, path_kind: str
+) -> None:
+    root = installation_root / (
+        "ascii" if path_kind == "ascii" else "long-" + "segment-" * 18
+    )
+    installed = _install_passport(
+        root,
+        environment_name="venv" if path_kind == "ascii" else "venv?井#percent%🧪",
+    )
+    candidate = b"#!" + os.fsencode(installed.python) + b"\n"
+    if path_kind == "ascii":
+        assert candidate.isascii() and b"#" not in candidate[2:]
+        assert len(candidate) <= 127
+    else:
+        assert b"#" in candidate[2:] and len(candidate) > 127
+    cwd = _cwd(tmp_path)
+    before = set(cwd.iterdir())
+    result = _run(
+        [str(installed.console), "--help"],
+        cwd=cwd,
+        installed=installed,
+        no_sqlite=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stderr == "" and "passport" in result.stdout
+    _, document = _cli(
+        installed,
+        cwd,
+        "inspect",
+        str(PROJECT_ROOT / "examples/passports/capture-recovery.passport.json"),
+        no_sqlite=True,
+    )
+    assert document["data"]["publisher_identity"] == "unverified"
+    assert set(cwd.iterdir()) == before
     assert not installed.audit_log.exists(), installed.audit_log.read_text()

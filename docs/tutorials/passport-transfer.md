@@ -8,8 +8,27 @@ there is no agent-creation CLI command. Passport v1 itself has no HTTP endpoints
 Run from the repository root after `uv sync --all-groups --frozen`, using Bash
 or Zsh. Use a fresh tutorial directory; the commands do not remove existing
 data. All IDs below come from actual command responses, not fixed UUIDs.
-Installed users can use their environment's `python` and `experience-hub`
-instead of `uv run`; neither the runtime nor its migrations needs a checkout.
+Installed users can follow the [native-console installation flow](../../README.md#installed-cli-and-special-character-paths)
+with a fresh `uv venv --relocatable` environment and uv wheel installation.
+Replace `uv run experience-hub` with that environment's quoted console path and
+`uv run python` with its installed Python interpreter. Neither the runtime nor
+its migrations needs a checkout.
+
+The same CLI is available through the installed interpreter's module entry:
+
+```bash
+".venv#hub/bin/python" -I -m experience_hub passport inspect \
+  examples/passports/capture-recovery.passport.json
+```
+
+Use the matching interpreter and actual Passport path for your installation.
+This is the fallback for an existing environment whose native launcher fails;
+do not edit that launcher. A normal non-relocatable macOS environment with a
+short `#` interpreter path can still fail before Python starts. The supported
+uv native flow depends on `/bin/sh`, `dirname`, and `realpath`, and its launcher
+must remain inside the environment; it does not promise general environment
+relocation. These entry choices do not change Passport validation, quarantine,
+or privacy boundaries.
 
 ## 1. Create source and receiving owners
 

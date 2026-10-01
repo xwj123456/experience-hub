@@ -95,6 +95,38 @@ working directory, not the source checkout. Installed packages carry their own
 migrations and do not require a repository checkout. Passport commands that
 use a database require an explicit `--database` path.
 
+### Installed CLI and special-character paths
+
+On macOS and other POSIX systems, the supported native-console installation
+flow creates a fresh environment with `uv venv --relocatable` and installs the
+wheel with uv. For example, from a checkout with no existing `.venv#hub`:
+
+```bash
+uv build --wheel
+uv venv --python 3.12 --relocatable ".venv#hub"
+uv pip install --python ".venv#hub/bin/python" \
+  dist/experience_hub-0.1.0-py3-none-any.whl
+".venv#hub/bin/experience-hub" --help
+".venv#hub/bin/python" -I -m experience_hub --help
+```
+
+For a downloaded wheel, use its actual filename instead of the build command
+and example wheel path. Dependency installation may require network access or
+a populated local cache; the application's default commands remain offline.
+An installed package does not need a checkout to run.
+
+The module command uses the same CLI and bypasses the generated console
+launcher. It is also the fallback for an existing environment: use that
+environment's installed Python interpreter, without editing its launcher or
+recreating the environment. In a normal non-relocatable environment on macOS,
+a short interpreter path containing `#` can still make an installer-generated
+shebang fail before Python starts. This package does not fix external installers.
+
+The relocatable uv launcher uses `/bin/sh`, `dirname`, and `realpath`; these must
+be available. Keep the launcher inside its environment. This installation flow
+does not promise that the entire environment or its other binaries can be moved
+or redistributed safely. See uv's [relocatable environment documentation](https://docs.astral.sh/uv/reference/cli/#uv-venv).
+
 ### ExperienceBench-S pilot
 
 The ExperienceBench-S 30-case pilot met its predefined expansion gate and is
